@@ -1,0 +1,51 @@
+{
+    "presets": [
+        {
+            "name": "举手暂停",
+            "description": "整个手掌正对摄像头悬停不动时暂停播放",
+            "conditions": {
+                "palm_hover": {
+                    "min": 0.5,
+                    "max": 1.0
+                },
+                "duration": 0.35
+            },
+            "action": "player_pause",
+            "priority": 10
+        },
+        {
+            "name": "挥手下一首",
+            "description": "手臂横向挥动（显像框中从右向左）切到下一首",
+            "conditions": {
+                "arm_horizontal_motion": {
+                    "min": 0.15,
+                    "max": 1.0
+                },
+                "wave_direction": {
+                    "min": 0.5,
+                    "max": 1.5
+                },
+                "duration": 0.05
+            },
+            "action": "player_next",
+            "priority": 10
+        },
+        {
+            "name": "挥手上一首",
+            "description": "手臂横向挥动（显像框中从左向右）切上一首",
+            "conditions": {
+                "arm_horizontal_motion": {
+                    "min": 0.15,
+                    "max": 1.0
+                },
+                "wave_direction": {
+                    "min": -1.5,
+                    "max": -0.5
+                },
+                "duration": 0.05
+            },
+            "action": "player_prev",
+            "priority": 10
+        }
+    ]
+}

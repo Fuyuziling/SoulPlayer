@@ -21,7 +21,11 @@ import re
 from typing import Dict, List, Optional, Any
 from pathlib import Path
 
-from gesture_presets import GesturePreset, PresetEngine
+from gesture_presets import (
+    GesturePreset, PresetEngine,
+    normalize_trajectory, resample_trajectory, dtw_distance,
+    POSE_SEGMENTS,  # 五部分判断法的部位分组（与识别端共用，保证录制/识别一致）
+)
 
 
 class CustomPreset(GesturePreset):
@@ -31,17 +35,24 @@ class CustomPreset(GesturePreset):
 
     def __init__(self, name: str, description: str,
                  conditions: dict, action: str, priority: int,
-                 tracks: List[str], favorite: bool = False, order: int = 9999):
+                 tracks: List[str], favorite: bool = False, order: int = 9999,
+                 start_pct: float = 0.0):
         super().__init__(name, description, conditions, action, priority)
         self.tracks = tracks  # 关联的歌曲文件路径列表
         self.favorite = favorite  # 收藏标记（收藏项置顶显示）
         self.order = order        # 手动排序序号（越小越靠前）
+        self.start_pct = start_pct  # 播放起始段落百分比 0.0~1.0（0.0 从头播放）
+        # 固定标记为自定义预设：PresetEngine.match 据此在匹配期间屏蔽内置动作。
+        # 必须在构造器里设置——否则本次会话新录制的预设经 preset_engine.add_preset
+        # 直接加入时缺标记，屏蔽机制不生效（"做自定义动作时误触切歌/上一首"根因）。
+        self._is_custom = True
 
     def to_dict(self) -> dict:
         d = super().to_dict()
         d["tracks"] = self.tracks
         d["favorite"] = self.favorite
         d["order"] = self.order
+        d["start_pct"] = self.start_pct
         return d
 
     @classmethod
@@ -58,6 +69,7 @@ class CustomPreset(GesturePreset):
             tracks=data.get("tracks", []),
             favorite=bool(data.get("favorite", False)),
             order=int(data.get("order", 9999)),
+            start_pct=float(data.get("start_pct", 0.0) or 0.0),
         )
 
     def pick_random_track(self) -> Optional[str]:
@@ -85,7 +97,9 @@ class PresetRecorder:
 
     def __init__(self, duration_sec: float = 3.0):
         self.duration_sec = duration_sec
-        self.samples: List[Dict[str, float]] = []
+        self.samples: List[Dict[str, float]] = []          # 动作期样本
+        self.baseline_samples: List[Dict[str, float]] = []  # 中性基线样本（倒计时/准备期）
+        self.trajectories: List[list] = []   # 录制期收集的肘部轨迹快照（DTW 模板用）
         self.state = self.STATE_IDLE
         self.countdown_start: Optional[float] = None
         self.recording_start: Optional[float] = None
@@ -93,6 +107,8 @@ class PresetRecorder:
     def start(self) -> None:
         """开始倒计时（倒计时结束后自动进入录制）。"""
         self.samples = []
+        self.baseline_samples = []
+        self.trajectories = []
         self.state = self.STATE_COUNTDOWN
         self.countdown_start = time.time()
         self.recording_start = None
@@ -108,6 +124,7 @@ class PresetRecorder:
         self.countdown_start = None
         self.recording_start = None
         self.samples = []
+        self.trajectories = []
 
     def feed(self, motion_features: dict) -> None:
         """每帧调用，传入当前动作特征。"""
@@ -115,6 +132,11 @@ class PresetRecorder:
             return
 
         if self.state == self.STATE_COUNTDOWN:
+            # 倒计时期间采样"中性基线"（用户准备/静止状态），
+            # 距离匹配用它判定"是否偏离静止"（静止时特征≈基线 → 不触发）
+            sample = self._extract_sample(motion_features)
+            if sample:
+                self.baseline_samples.append(sample)
             elapsed = time.time() - self.countdown_start
             if elapsed >= self.COUNTDOWN_SEC:
                 # 倒计时结束，开始录制
@@ -128,18 +150,45 @@ class PresetRecorder:
                 self.state = self.STATE_FINISHED
                 return
 
-            # 提取数值特征
-            sample = {}
-            for key in ["motion_energy", "arm_motion_energy", "body_speed", "arm_amplitude", "body_rhythm", "arm_horizontal_motion"]:
-                if key in motion_features and isinstance(motion_features[key], (int, float)):
-                    sample[key] = float(motion_features[key])
-            for key in ["posture", "hand_position"]:
-                if key in motion_features:
-                    sample[key] = motion_features[key]
-            if "is_active" in motion_features:
-                sample["is_active"] = bool(motion_features["is_active"])
+            sample = self._extract_sample(motion_features)
+            if sample:
+                self.samples.append(sample)
+            # 收集肘部轨迹快照（供 DTW 轨迹模板匹配）
+            traj = motion_features.get("arm_trajectory")
+            if traj and len(traj) >= 2:
+                self.trajectories.append(
+                    [(float(p[0]), float(p[1])) for p in traj])
 
-            self.samples.append(sample)
+    def _extract_sample(self, motion_features: dict) -> dict:
+        """从一帧特征中提取录制用样本（数值特征 + 离散枚举 + 构型特征）。"""
+        sample = {}
+        # 含 palm_hover / wave_direction：它们是内置动作（举手暂停/挥手切歌）
+        # 的判别特征，录制时采样它们才能在生成条件时与通用动作区分开
+        for key in ["motion_energy", "arm_motion_energy", "body_speed",
+                    "arm_amplitude", "body_rhythm", "arm_horizontal_motion",
+                    "palm_hover", "wave_direction"]:
+            if key in motion_features and isinstance(motion_features[key], (int, float)):
+                sample[key] = float(motion_features[key])
+        # 静态构型特征（五段：头部/胸腔/大臂/小臂/手部）：与运动特征互补——
+        # 动态动作依赖运动量判别，静态动作依赖构型判别。
+        # 构型特征仅在关节可见时存在（None 被 isinstance 过滤自动跳过）。
+        for key in ["pose_head_dx", "pose_head_dy",
+                    "pose_torso_dx", "pose_torso_dy",
+                    "pose_upper_dx_L", "pose_upper_dy_L",
+                    "pose_upper_dx_R", "pose_upper_dy_R",
+                    "pose_fore_dx_L", "pose_fore_dy_L",
+                    "pose_fore_dx_R", "pose_fore_dy_R",
+                    "pose_hand_dx_L", "pose_hand_dy_L",
+                    "pose_hand_dx_R", "pose_hand_dy_R",
+                    "pose_spread_L", "pose_spread_R"]:
+            if key in motion_features and isinstance(motion_features[key], (int, float)):
+                sample[key] = float(motion_features[key])
+        for key in ["posture", "hand_position", "hand_gesture_L", "hand_gesture_R"]:
+            if key in motion_features:
+                sample[key] = motion_features[key]
+        if "is_active" in motion_features:
+            sample["is_active"] = bool(motion_features["is_active"])
+        return sample
 
     def is_countdown(self) -> bool:
         return self.state == self.STATE_COUNTDOWN
@@ -173,40 +222,167 @@ class PresetRecorder:
 
     def generate_conditions(self) -> dict:
         """
-        根据采样数据生成条件字典。
-        策略：数值特征取 min/max 扩展 20% 余量，离散取最频繁值。
+        根据采样数据生成条件字典（方案A：中性基线 + 动作模板）。
+
+        结构：
+        {
+          "duration": 0.3,
+          "baseline": {特征: 均值},      # 倒计时/准备期的静止基线
+          "action": {特征: 均值},        # 录制期的动作模板
+          "action_std": {特征: 标准差},   # 动作期标准差（距离归一化用）
+          "posture"/"hand_position": [值] # 稳定的离散区分（可选）
+        }
+
+        触发时采用距离匹配：当前特征距动作模板近（<2σ），
+        且明显偏离中性基线（距基线 > 距动作×1.5）才触发——
+        静止时特征≈基线，两条都判不满足，天然免疫"静止即触发"。
+        duration=0.3s：连续满足 0.3 秒即触发（举手暂停=0.35 同级），
+        瞬时动作（挥/拍约 0.3~0.5s）可达到；旧值 1.0s 需动作保持
+        整整 1 秒不中断，任何一帧抖动即清零 → "重录后永远无法触发"。
         """
         if not self.samples:
-            return {"duration": 1.0}
+            return {"duration": 0.3}
 
-        conditions = {"duration": 1.0}
+        numeric_keys = ["motion_energy", "arm_motion_energy", "body_speed",
+                        "arm_amplitude", "body_rhythm", "arm_horizontal_motion",
+                        "palm_hover", "wave_direction"]
 
-        numeric_keys = ["motion_energy", "arm_motion_energy", "body_speed", "arm_amplitude", "body_rhythm", "arm_horizontal_motion"]
+        def _mean(values):
+            return sum(values) / len(values) if values else 0.0
+
+        def _std(values):
+            if len(values) < 2:
+                return 0.0
+            m = _mean(values)
+            return (sum((v - m) ** 2 for v in values) / len(values)) ** 0.5
+
+        baseline = {}
+        action = {}
+        action_std = {}
         for key in numeric_keys:
-            values = [s[key] for s in self.samples if key in s]
-            if values:
-                min_val = min(values)
-                max_val = max(values)
-                margin = (max_val - min_val) * 0.2 + 0.05
-                min_val = max(0.0, min_val - margin)
-                max_val = min(1.0, max_val + margin)
-                conditions[key] = {"min": round(min_val, 3), "max": round(max_val, 3)}
+            bvals = [s[key] for s in self.baseline_samples if key in s]
+            avals = [s[key] for s in self.samples if key in s]
+            if bvals:
+                baseline[key] = round(_mean(bvals), 3)
+            if avals:
+                action[key] = round(_mean(avals), 3)
+                action_std[key] = round(_std(avals), 3)
 
-        # 枚举特征只保留"可分类且稳定"的值：
-        # "unknown" 是识别失败的噪声而非动作特征，若写入条件会导致
-        # 正常坐下/站立时永远匹配不上（自定义动作不触发的根因）
-        for key in ["posture", "hand_position"]:
-            values = [s[key] for s in self.samples if key in s]
+        conditions = {"duration": 0.3}
+        if baseline:
+            conditions["baseline"] = baseline
+        if action:
+            conditions["action"] = action
+        if action_std:
+            conditions["action_std"] = action_std
+
+        # ── 静态构型模板（pose）+ 动态度 D：静态/动态判定有机结合 ──
+        # 构型特征（肘角/腕偏移/spread）只在静止/慢动时稳定可靠，
+        # 运动特征只在动作时才有信息——两者互补而非冗余。
+        # 动态度 D（0~1）由录制期的轨迹幅度 + 运动能量方差共同决定：
+        #   轨迹幅度大 / 能量波动大 → D 高（动态动作）→ 偏重运动比对；
+        #   轨迹幅度小 / 能量平稳     → D 低（静态动作）→ 偏重构型比对。
+        # duration 随 D 自适应：静态动作要求保持更久（0.3→1.0s 线性），
+        # 天然过滤"动态手势中某帧恰好经过该构型"的假匹配——
+        # 挥手只有一瞬间构型吻合，hold_timer 攒不够 1s。
+        # ── 静态构型模板（pose）：只纳入"明显参与动作"的部位 ──
+        # 五段分组：头部/胸腔/大臂/小臂/手部。录制时解析动作样本，
+        # 某部位在录制期内变化幅度达到阈值（明显在动）才纳入该动作的
+        # 判别标准；未明显参与的部位（如只动手臂时头部/胸腔几乎不动）
+        # 不纳入 → 触发时不约束该部位，避免"没动的地方也要对上"导致
+        # 自定义动作难以触发/误触发。触发端 _match_template 对已纳入
+        # 的部位全部比对达成才播放（见 gesture_presets.py）。
+        # 阈值 0.02 = 2% 屏宽：参考 MediaPipe 静止抖动约 0.001、生理性
+        # 震颤极小；动作时部位位移通常 ≥ 2~3% 屏宽，0.02 可区分"动了"
+        # 与"静止未参与"。
+        # 五段分组 POSE_SEGMENTS 由 gesture_presets 导入（识别端共用）：
+        # 头部/胸腔/大臂/小臂/手部。某部位变化幅度达到 SEG_MIN_SPAN
+        # 才纳入该动作的判别标准。
+        SEG_MIN_SPAN = 0.02   # 部位变化幅度阈值：明显参与动作才算
+        seg_spans = {}
+        for seg_name, seg_keys in POSE_SEGMENTS:
+            span = 0.0
+            for key in seg_keys:
+                avals = [s[key] for s in self.samples if key in s]
+                if avals:
+                    span = max(span, max(avals) - min(avals))
+            seg_spans[seg_name] = span
+
+        pose = {}
+        pose_std = {}
+        active_segs = []
+        for seg_name, seg_keys in POSE_SEGMENTS:
+            if seg_spans[seg_name] >= SEG_MIN_SPAN:
+                active_segs.append(seg_name)
+                for key in seg_keys:
+                    avals = [s[key] for s in self.samples if key in s]
+                    if avals:
+                        pose[key] = round(_mean(avals), 4)
+                        pose_std[key] = round(max(_std(avals), 0.05), 4)
+
+        # 兜底：所有部位都未明显参与（纯静止录制，如悬停姿势）→ 全部纳入，
+        # 让"保持该姿势"成为判据（静态动作需要整身对上）。
+        # 注意：兜底时 active_segs 保持为空列表——用于区分"动作类型"
+        #（有明显参与部位，触发时须真的在动）与"纯静态姿势"（静止保持即可）。
+        if not active_segs:
+            for seg_name, seg_keys in POSE_SEGMENTS:
+                for key in seg_keys:
+                    avals = [s[key] for s in self.samples if key in s]
+                    if avals:
+                        pose[key] = round(_mean(avals), 4)
+                        pose_std[key] = round(max(_std(avals), 0.05), 4)
+
+        # 动态度：轨迹跨度（归一化到 0.15）与运动能量方差（归一化到 0.1）
+        # 各占一半权重，clamp 到 [0,1]。
+        traj_span = 0.0
+        if self.trajectories:
+            traj_span = max(
+                (max(p[0] for p in t) - min(p[0] for p in t))
+                + (max(p[1] for p in t) - min(p[1] for p in t))
+                for t in self.trajectories
+            )
+        energy_vals = [s.get("motion_energy", 0.0) for s in self.samples]
+        energy_std = _std(energy_vals) if energy_vals else 0.0
+        dynamism = max(0.0, min(1.0,
+            (traj_span / 0.15 + energy_std / 0.1) / 2.0))
+
+        if pose:
+            conditions["pose"] = pose
+            conditions["pose_std"] = pose_std
+        # 记录"明显参与动作的部位"（非空 = 动作类型；空 = 纯静态姿势）。
+        # 触发端据此要求：动作类型必须当前偏离静止基线（真的在动）才触发，
+        # 防止静止时手停在录制姿态附近被 pose 构型判定误命中（"静止误触"根因）。
+        conditions["active_segments"] = list(active_segs)
+        conditions["dynamism"] = round(dynamism, 3)
+        # duration = 0.3 + 0.7×(1-D)：静态 1.0s / 动态 0.3s 线性过渡
+        conditions["duration"] = round(0.3 + 0.7 * (1.0 - dynamism), 2)
+
+        # DTW 轨迹模板：取录制期间肘部跨度最大的快照（代表动作主体形态），
+        # 下采样到 20 点并归一化，供触发端 _match_template 用 DTW 匹配。
+        # 跨度按 x+y 综合计算——上下摇摆等纵向动作肘部横向跨度小，
+        # 若只按 x 会选不出动作主体（自定义动作无法触发的根因之一）。
+        # 轨迹形状（而非数值区间）是更本质的判别：同一种动作快慢/幅度不同
+        # 都能匹配，手指动作的轨迹形态与录制动作完全不同 → DTW 距离大。
+        if self.trajectories:
+            best_traj = max(
+                self.trajectories,
+                key=lambda t: ((max(p[0] for p in t) - min(p[0] for p in t))
+                               + (max(p[1] for p in t) - min(p[1] for p in t))),
+            )
+            conditions["trajectory"] = normalize_trajectory(
+                resample_trajectory(best_traj, 20)).tolist()
+
+        # 离散枚举只保留"可分类且稳定"的值（动作特征之外，辅助区分）
+        # hand_gesture_L/R：精细手型（open/fist/victory/ok/thumbs_up/pointing）；
+        # 过滤 None/unknown/half_fist——半握是兜底分类，用于判别不可靠
+        for key in ["posture", "hand_position", "hand_gesture_L", "hand_gesture_R"]:
+            values = [s[key] for s in self.samples
+                      if key in s and s[key] not in (None, "unknown", "half_fist")]
             if values:
                 from collections import Counter
                 value, count = Counter(values).most_common(1)[0]
-                if value != "unknown" and count / len(values) >= 0.6:
+                if count / len(values) >= 0.6:
                     conditions[key] = [value]
-
-        # 不写 is_active 条件：它由 motion_energy/body_speed 推导，
-        # 与数值条件存在推导关系，一起写入容易自相矛盾
-        # （例如 motion_energy≤0.05 与 is_active=true 几乎不可能同时成立，
-        #  这是历史预设"录了却永远不触发"的根因之一）
         return conditions
 
     def get_recording_summary(self) -> str:
@@ -306,7 +482,8 @@ class CustomPresetManager:
 
         - posture/hand_position 为 ["unknown"]：识别失败的产物，删除
         - is_active 条件：与数值特征存在推导关系易自相矛盾，删除
-        - duration > 1.0：降到 1.0（过长容易被动作中断永远达不到）
+        - duration > 1.0：降到 1.0（旧版 1.0+ 需动作保持过久；新录制动态
+          动作已是 0.3、静态动作 1.0，均在合理范围，仅拦截历史超长值）
         """
         changed = False
         cond = preset.conditions
@@ -327,6 +504,83 @@ class CustomPresetManager:
             changed = True
         return changed
 
+    @staticmethod
+    def is_idle_matching(conditions: dict, strict: bool = True) -> bool:
+        """
+        检测"静止即触发"的退化预设 / 录制内容是否近似静止。
+
+        录制时若几乎没动，generate_conditions 会生成 motion_energy 上限极小的
+        条件（如 0~0.05），导致"站着不动"也满足 → 用户静止时每 1s 冷却后
+        反复触发 custom_play（播放系统陷入频繁触发），且屏蔽内置动作。
+        加载与录制结束时都应拒绝此类条件。
+
+        注意：motion_energy 只统计躯干+腿部（不含手臂）——拍桌/指人等
+        手臂动作躯干几乎不动，若只看 motion_energy 会把正常录制误判为静止。
+        因此：
+        - strict=False（录制时）：综合所有运动类指标，任一显著即有动作；
+        - strict=True（加载时）：以 motion_energy 上限为主判据，
+          拦截历史退化预设（如 motion_energy 上限极小但手臂指标为全范围）。
+
+        阈值 0.12 需容纳 margin 扩展：generate_conditions 的 max 会
+        +0.05~0.08 余量，静止录制（真实 max≈0.03）扩展后约 0.084，
+        正常动作（真实 max≥0.15）扩展后 ≥0.2，0.12 居中安全。
+        """
+        if not isinstance(conditions, dict):
+            return False
+        numeric = ("motion_energy", "arm_motion_energy", "body_speed",
+                   "arm_horizontal_motion")
+        numeric_cond = {k: v for k, v in conditions.items()
+                        if k in numeric and isinstance(v, dict)}
+        if not numeric_cond:
+            return False
+        if strict:
+            # 加载（strict=True）：motion_energy 上限极小 → 静止状态也满足，
+            # 拦截历史退化预设（如 motion_energy 0~0.05 但手臂指标为全范围）
+            me = conditions.get("motion_energy")
+            if isinstance(me, dict) and me.get("max", 1.0) <= 0.12:
+                return True
+        # 主判据（录制 strict=False）：任一运动类指标上限显著 → 有动作，放行。
+        # motion_energy 只统计躯干腿部，拍桌/指人等手臂动作须看 arm_motion_energy
+        if any(v.get("max", 1.0) > 0.12 for v in numeric_cond.values()):
+            return False
+        # 全部运动类指标上限都很小 → 近似静止
+        if all(v.get("max", 1.0) <= 0.12 for v in numeric_cond.values()):
+            # 有离散区分（posture/hand_position）时不判定为静止
+            for k in ("posture", "hand_position"):
+                v = conditions.get(k)
+                if isinstance(v, list) and v and all(x != "unknown" for x in v):
+                    return False
+            return True
+        return False
+
+    @staticmethod
+    def count_discriminators(conditions: dict) -> int:
+        """
+        统计自定义动作条件的"有效判定点"数量。
+
+        判定点 = 能排除"静止状态"（所有特征≈0）的约束：
+        - 运动类数值特征 min > 0.08：要求该特征必须达到一定水平才匹配，
+          静止（≈0）不满足 → 算 1 个判定点；
+        - 离散特征（posture / hand_position）有明确值（非 unknown）→ 算 1 个。
+
+        只有 1 个判定点的动作区分度不足：静止时也可能满足 → 反复误触卡死。
+        录制校验要求至少 2 个判定点（用户建议），保证动作"真的在做动作"。
+        """
+        if not isinstance(conditions, dict):
+            return 0
+        count = 0
+        numeric = ("motion_energy", "arm_motion_energy", "body_speed",
+                   "arm_amplitude", "body_rhythm", "arm_horizontal_motion")
+        for k in numeric:
+            v = conditions.get(k)
+            if isinstance(v, dict) and v.get("min", 0.0) > 0.08:
+                count += 1
+        for k in ("posture", "hand_position"):
+            v = conditions.get(k)
+            if isinstance(v, list) and v and all(x != "unknown" for x in v):
+                count += 1
+        return count
+
     def load(self):
         """
         从 storage_dir 加载所有自定义预设。
@@ -345,11 +599,18 @@ class CustomPresetManager:
                 if isinstance(data, dict) and "name" in data:
                     # 单预设格式（v2.0）
                     preset = CustomPreset.from_dict(data)
+                    # 拒绝"静止即触发"的退化预设：避免用户静止时频繁误触发
+                    if self.is_idle_matching(preset.conditions):
+                        print(f"[CustomPresetManager] 跳过退化预设（静止即触发，避免频繁误触发）: {preset.name}")
+                        continue
                     self.presets.append(preset)
                 elif isinstance(data, dict) and "custom_presets" in data:
                     # 旧版集合格式（理论上已被迁移，但防御性兼容）
                     for preset_data in data["custom_presets"]:
                         preset = CustomPreset.from_dict(preset_data)
+                        if self.is_idle_matching(preset.conditions):
+                            print(f"[CustomPresetManager] 跳过退化预设（静止即触发）: {preset.name}")
+                            continue
                         self.presets.append(preset)
                 else:
                     print(f"[CustomPresetManager] 无法识别的格式: {json_file.name}")
@@ -389,7 +650,8 @@ class CustomPresetManager:
         for preset in self.presets:
             self._save_single_preset(preset)
 
-    def add_preset(self, name: str, conditions: dict, tracks: List[str]) -> CustomPreset:
+    def add_preset(self, name: str, conditions: dict, tracks: List[str],
+                   start_pct: float = 0.0) -> CustomPreset:
         """
         添加新的自定义预设。
 
@@ -397,6 +659,7 @@ class CustomPresetManager:
             name: 预设名称
             conditions: 触发条件
             tracks: 关联歌曲列表
+            start_pct: 播放起始段落百分比 0.0~1.0（0.0 从头播放）
 
         Returns:
             创建的 CustomPreset 实例
@@ -414,7 +677,8 @@ class CustomPresetManager:
             conditions=conditions,
             action="custom_play",
             priority=20,  # 高于内置动作（举手/挥手=10）：匹配到自定义动作就触发
-            tracks=tracks
+            tracks=tracks,
+            start_pct=max(0.0, min(1.0, float(start_pct or 0.0))),
         )
         self.presets.append(preset)
         self._save_single_preset(preset)

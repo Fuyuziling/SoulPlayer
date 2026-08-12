@@ -393,6 +393,15 @@ except ImportError:
         def is_playing(self) -> bool:
             return pygame.mixer.music.get_busy()
 
+        def get_playback_position(self) -> float:
+            return 0.0
+
+        def get_track_duration(self) -> float:
+            return -1.0
+
+        def seek_to(self, position_sec: float) -> None:
+            pass
+
         @property
         def current_track(self) -> dict:
             if self._playlist and 0 <= self._current_index < len(self._playlist):
@@ -404,6 +413,88 @@ except ImportError:
                     'index': self._current_index,
                 }
             return {'title': '无曲目', 'filename': '', 'path': '', 'index': -1}
+
+
+class _MusicPlayerStub:
+    """
+    pygame.mixer 初始化失败时的降级播放器。
+
+    接口与 MusicPlayer 对齐，但全部为安全空操作。此时 mixer 不可用，
+    任何 pygame.mixer 调用都会抛 pygame.error，因此这里不做任何底层调用。
+    """
+
+    def __init__(self):
+        self._playlists: dict = {}
+        self._current_playlist_key = None
+        self._tracks: list = []
+        self._current_index = -1
+        self._playing = False
+        self._paused = False
+        self._volume = 0.5
+
+    def load_playlist(self, folder_path: str):
+        print(f"[播放器不可用] 忽略加载: {folder_path}")
+
+    def play(self, track_index=None):
+        pass
+
+    def pause(self):
+        pass
+
+    def stop(self):
+        pass
+
+    def next_track(self):
+        pass
+
+    def previous_track(self):
+        pass
+
+    def play_track(self, filepath: str):
+        pass
+
+    def set_volume(self, volume: float):
+        self._volume = float(max(0.0, min(1.0, volume)))
+
+    def crossfade_to(self, *args, **kwargs):
+        pass
+
+    def set_playlist_by_mood(self, mood: str):
+        pass
+
+    def sync_folder(self, folder_path: str):
+        return [], []
+
+    def get_playlist_info(self) -> dict:
+        return {
+            "total_tracks": 0,
+            "current_index": -1,
+            "playlist_key": None,
+            "tracks": [],
+        }
+
+    def register_playlist(self, key: str, tracks: list):
+        pass
+
+    def unload(self):
+        pass
+
+    @property
+    def is_playing(self) -> bool:
+        return False
+
+    def get_playback_position(self) -> float:
+        return 0.0
+
+    def get_track_duration(self) -> float:
+        return -1.0
+
+    def seek_to(self, position_sec: float) -> None:
+        pass
+
+    @property
+    def current_track(self) -> dict:
+        return {}
 
 
 # 自定义预设
@@ -427,9 +518,10 @@ except ImportError:
             self._queue = None
         def load(self): pass
         def save(self): pass
-        def add_trigger(self, phrase, action, tracks=None): pass
+        def add_trigger(self, phrase, action, tracks=None, start_pct=0.0): pass
         def remove_trigger(self, phrase): pass
         def get_tracks(self, phrase): return []
+        def get_start_pct(self, phrase): return 0.0
         def start_capture(self): pass
         def stop_capture(self): return ""
         def start_listening(self): pass
@@ -441,10 +533,12 @@ except ImportError:
 
 # UI 主题与动画系统
 try:
-    from ui_theme import SoulTheme, UIRenderer, ICONS, draw_pose_skeleton, value_to_color
+    from ui_theme import SoulTheme, UIRenderer, ICONS, draw_pose_skeleton, value_to_color, \
+        draw_hand_skeleton
     from ui_animations import AnimationManager, Easing
 except ImportError:
     SoulTheme = UIRenderer = ICONS = draw_pose_skeleton = value_to_color = None
+    draw_hand_skeleton = None
     AnimationManager = Easing = None
 
 
@@ -482,14 +576,24 @@ class SoulPlayerApp:
     WIN_HEIGHT = 720
     PREVIEW_W = 320
     PREVIEW_H = 240
-    FPS = 30
+    FPS = 60
 
     def __init__(self):
         """
         初始化 Pygame、各子模块及界面状态。
         """
         print("[DEBUG] 开始初始化...")
-        
+
+        # 关键修复：Windows 微软拼音等 IME 的候选框不显示问题。
+        # SDL 在 Windows 上默认以 UILess 模式抑制系统原生 IME UI（候选框），
+        # 导致改名时"拼音能键入、却看不到候选字"（约等于盲打）。
+        # SDL hint 需在 SDL 初始化（pygame.init）之前生效，故用环境变量设置：
+        # SDL_HINT_IME_SHOW_UI=1 → SDL 显示系统原生 IME 候选框
+        #（SDL 2.0.18+ 支持，pygame 2.6.1 / SDL 2.28.4 已包含）。
+        # 仅当进入改名等文本输入场景（start_text_input）时 IME 才接管；
+        # 平时 stop_text_input 仍保证 R/V 等字母快捷键直达程序，互不影响。
+        os.environ["SDL_HINT_IME_SHOW_UI"] = "1"
+
         pygame.init()
         print("[DEBUG] pygame 初始化完成")
         
@@ -562,31 +666,7 @@ class SoulPlayerApp:
                 self._add_log("未找到音乐文件夹，请创建 music/ 目录")
         except Exception as e:
             print(f"[警告] 音频播放器初始化失败: {e}")
-            self.player = MusicPlayer.__new__(MusicPlayer)
-            self.player._playlists = {}
-            self.player._current_playlist_key = None
-            self.player._tracks = []
-            self.player._current_index = -1
-            self.player._playing = False
-            self.player._paused = False
-            self.player._volume = 0.5
-            self.player._last_volume_before_fade = 0.5
-            self.player._fade_lock = threading.Lock()
-            self.player._fade_thread = None
-            self.player._fade_stop_event = threading.Event()
-            self.player._track_metadata_cache = {}
-            self.player.load_playlist = lambda p: print(f"[播放器不可用] 忽略加载: {p}")
-            self.player.play = lambda *a, **kw: None
-            self.player.pause = lambda: None
-            self.player.stop = lambda: None
-            self.player.next_track = lambda: None
-            self.player.previous_track = lambda: None
-            self.player.set_volume = lambda v: setattr(self.player, '_volume', float(v))
-            self.player.crossfade_to = lambda *a, **kw: None
-            self.player.set_playlist_by_mood = lambda m: None
-            # 用 _playing 属性替代 is_playing property，避免直接赋值报错
-            self.player._playing = False
-            self.player.current_track = {}
+            self.player = _MusicPlayerStub()
             print("[DEBUG] 音乐播放器降级完成")
 
         # 自定义预设管理器
@@ -637,13 +717,45 @@ class SoulPlayerApp:
         self._song_select_rects = []
         # 语音面板模板行的删除按钮矩形（每帧重算）
         self._voice_actions = []
+        self._voice_scroll = 0
+        self._voice_list_rect = None
+        # 预览框动作骨架显隐（默认显示，按钮可切换）
+        self._skeleton_visible = True
         # 语音台词录制状态机: None | {"phase": "countdown"|"recording", "t0": float, "auto_started": bool}
         self._voice_rec = None
+        # 播放栏进度条拖拽状态
+        self._seek_dragging = False
+        self._seek_hovered = False
+        # 音量条拖拽状态与热区（每帧刷新）
+        self._vol_dragging = False
+        self._vol_bar_rect = None
+        # 录制后段落选择面板（选歌后的非强制步骤）
+        # 结构: {"tracks": [str], "sections": {track_idx: {"start_pct": float, "label": str}},
+        #        "current_track_idx": int, "scroll": int, "mode": "motion"|"voice", "phrase": str,
+        #        "pending_preset_name": str, "pending_conditions": dict}
+        self._section_select = None
+        self._section_select_rects = []
+        # 段落选择进度条拖拽状态（点击时间轴后置位，松开鼠标复位）
+        self._section_dragging = False
         # 人声/扬声器分离：说话期间自动压低音乐音量（记录原音量，None 表示未压低）
         self._voice_ducked = None
         self._duck_until = 0.0
         # music 文件夹动态监测：上次扫描时间戳
         self._last_music_scan = 0.0
+        # 音乐列表弹窗（手动选歌播放）：True 为打开
+        self._music_list_open = False
+        self._music_list_scroll = 0
+        self._music_list_rects = []
+        self._music_list_btn_rect = None
+        # 常驻歌单面板滚动状态
+        self._play_scroll = 0
+        self._playlist_rect = None
+        # 底部信息区页签：动作特征 / 事件日志（折叠切换）
+        self._bottom_tab = "features"
+        self._bottom_tab_rects = []
+        self._tab_anim = {"features": 0.0, "log": 0.0}  # 页签 hover 缩放进度
+        # 音量调整后的数值回显弹标截止时间（0 表示不显示）
+        self._vol_popup_until = 0.0
 
         # 运行状态（已提前初始化，此处可省略）
 
@@ -811,6 +923,27 @@ class SoulPlayerApp:
                             break
                 continue
 
+            # 音乐列表弹窗：点击行播放 / 点击关闭按钮 / Esc 关闭 / 滚轮翻页
+            if self._music_list_open:
+                if event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_ESCAPE:
+                        self._music_list_open = False
+                        if self.anim:
+                            self.anim.close_modal()
+                elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                    for rect, act in self._music_list_rects:
+                        if rect.collidepoint(event.pos):
+                            if act == "close":
+                                self._music_list_open = False
+                                if self.anim:
+                                    self.anim.close_modal()
+                            elif isinstance(act, int):
+                                self._play_from_music_list(act)
+                            break
+                elif event.type == pygame.MOUSEWHEEL:
+                    self._music_list_scroll = max(0, self._music_list_scroll - event.y)
+                continue
+
             # 选歌面板：Enter 保存 / Esc 取消 / 点击行切换勾选 / 滚轮翻页
             if self._song_select is not None:
                 if event.type == pygame.KEYDOWN:
@@ -833,19 +966,136 @@ class SoulPlayerApp:
                         0, self._song_select["scroll"] - event.y)
                 continue
 
+            # 段落选择面板：Enter 保存 / Esc 跳过 / 点击按钮或拖动进度条选择段落
+            if self._section_select is not None:
+                if event.type == pygame.KEYDOWN:
+                    if event.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+                        self._confirm_section_select()
+                    elif event.key == pygame.K_ESCAPE:
+                        self._skip_section_select()
+                elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                    for rect, act in getattr(self, '_section_select_rects', []):
+                        if rect.collidepoint(event.pos):
+                            if act == "confirm":
+                                self._confirm_section_select()
+                            elif act == "skip":
+                                self._skip_section_select()
+                            elif act == "timeline":
+                                # 点击时间轴：按鼠标 x 定位段落并进入拖拽
+                                self._section_dragging = True
+                                pct = max(0.0, min(1.0, (event.pos[0] - rect.x) / max(1, rect.width)))
+                                self._section_select_set_start(pct)
+                            elif act.startswith("preset:"):
+                                pct = float(act.split(":")[1])
+                                self._section_select_set_start(pct)
+                            break
+                elif event.type == pygame.MOUSEMOTION and self._section_dragging:
+                    # 拖拽中：跟随鼠标 x 实时更新段落
+                    for rect, act in getattr(self, '_section_select_rects', []):
+                        if act == "timeline":
+                            pct = max(0.0, min(1.0, (event.pos[0] - rect.x) / max(1, rect.width)))
+                            self._section_select_set_start(pct)
+                            break
+                elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+                    self._section_dragging = False
+                continue
+
+            elif event.type == pygame.MOUSEWHEEL:
+                vlr = getattr(self, '_voice_list_rect', None)
+                if vlr and vlr.collidepoint(pygame.mouse.get_pos()):
+                    templates = []
+                    if self.voice_trigger and hasattr(self.voice_trigger, 'list_templates'):
+                        templates = self.voice_trigger.list_templates()
+                    max_scroll = max(0, len(templates) - 3)
+                    self._voice_scroll = max(0, min(self._voice_scroll - event.y, max_scroll))
+                plr = getattr(self, '_playlist_rect', None)
+                if plr and plr.collidepoint(pygame.mouse.get_pos()):
+                    self._play_scroll = max(0, self._play_scroll - event.y)
+
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-                # 左键点击：优先语音模板删除按钮，其次自定义预设悬停编辑按钮
+                # 底部信息区页签切换
+                for rect, tab in getattr(self, '_bottom_tab_rects', []):
+                    if rect.collidepoint(event.pos):
+                        self._bottom_tab = tab
+                        break
+                # 音乐列表按钮：打开歌单弹窗
+                btn_rect = getattr(self, '_music_list_btn_rect', None)
+                if btn_rect and btn_rect.collidepoint(event.pos):
+                    self._music_list_open = True
+                    self._music_list_scroll = 0
+                    if self.anim:
+                        self.anim.open_modal()
+                    continue
+                # 音量条点击/拖拽调节（热区在进度条上方，优先检测）
+                vol_rect = getattr(self, '_vol_bar_rect', None)
+                if vol_rect and vol_rect.collidepoint(event.pos):
+                    self._vol_dragging = True
+                    self._update_volume_from_mouse(event.pos[0])
+                    continue
+                # 优先检测进度条点击
+                seek_rect = getattr(self, '_seek_bar_rect', None)
+                if seek_rect and seek_rect.collidepoint(event.pos):
+                    self._seek_dragging = True
+                    self._update_seek_from_mouse(event.pos[0])
+                    continue
+                # 左键点击：优先预览框骨架显隐，其次语音模板编辑按钮，再次自定义预设
+                sk_rect = getattr(self, '_skeleton_btn_rect', None)
+                if sk_rect and sk_rect.collidepoint(event.pos):
+                    self._skeleton_visible = not self._skeleton_visible
+                    self._add_log(f"🦴 动作骨架已{'显示' if self._skeleton_visible else '隐藏'}")
+                    continue
                 voice_hit = False
-                for rect, tpl_name in getattr(self, '_voice_actions', []):
+                for rect, tpl_name, action in getattr(self, '_voice_actions', []):
                     if rect.collidepoint(event.pos):
                         tracks = (self.voice_trigger.get_tracks(tpl_name)
                                   if self.voice_trigger else [])
-                        self._deleting_preset = _VoiceTemplateRef(tpl_name, tracks)
-                        self._add_log(f"🗑 确认删除语音模板 [{tpl_name}]？（Enter 确认 / Esc 取消）")
+                        if action == "rename":
+                            # 用 Tk 原生对话框改名（SDL 无法显示微软拼音候选框，
+                            # 见 _ask_rename_dialog 说明）；Enter/Esc 后直接确认/取消
+                            ref = _VoiceTemplateRef(tpl_name, tracks)
+                            new_name = self._ask_rename_dialog(ref)
+                            if new_name:
+                                self._renaming_preset = ref
+                                self._rename_text = new_name
+                                self._confirm_rename()
+                            else:
+                                self._add_log(f"✏️ 已取消重命名 [{tpl_name}]")
+                        elif action == "delete":
+                            self._deleting_preset = _VoiceTemplateRef(tpl_name, tracks)
+                            self._add_log(f"🗑 确认删除语音模板 [{tpl_name}]？（Enter 确认 / Esc 取消）")
+                        elif action == "favorite":
+                            if hasattr(self.voice_trigger, 'toggle_favorite'):
+                                state = self.voice_trigger.toggle_favorite(tpl_name)
+                                if state:
+                                    self._add_log(f"⭐ 已收藏台词 [{tpl_name}]，置顶显示")
+                                else:
+                                    self._add_log(f"☆ 已取消收藏台词 [{tpl_name}]")
+                        elif action == "move_left":
+                            if hasattr(self.voice_trigger, 'move_template'):
+                                if self.voice_trigger.move_template(tpl_name, -1):
+                                    self._add_log(f"← [{tpl_name}] 已前移")
+                        elif action == "move_right":
+                            if hasattr(self.voice_trigger, 'move_template'):
+                                if self.voice_trigger.move_template(tpl_name, +1):
+                                    self._add_log(f"→ [{tpl_name}] 已后移")
                         voice_hit = True
                         break
                 if not voice_hit:
                     self._handle_custom_preset_click(event.pos)
+
+            elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+                if self._vol_dragging:
+                    self._vol_dragging = False
+                    self._update_volume_from_mouse(event.pos[0])
+                if self._seek_dragging:
+                    self._seek_dragging = False
+                    self._update_seek_from_mouse(event.pos[0])
+
+            elif event.type == pygame.MOUSEMOTION:
+                if self._vol_dragging:
+                    self._update_volume_from_mouse(event.pos[0])
+                elif self._seek_dragging:
+                    self._update_seek_from_mouse(event.pos[0])
 
             elif event.type == pygame.KEYDOWN:
                 # 退出
@@ -868,9 +1118,11 @@ class SoulPlayerApp:
                 # 音量
                 elif event.key == pygame.K_UP:
                     self.player.set_volume(self.player._volume + 0.05)
+                    self._vol_popup_until = time.time() + 1.2
                     self._add_log(f"音量上调至 {self.player._volume:.0%}")
                 elif event.key == pygame.K_DOWN:
                     self.player.set_volume(self.player._volume - 0.05)
+                    self._vol_popup_until = time.time() + 1.2
                     self._add_log(f"音量下调至 {self.player._volume:.0%}")
                 # 自定义预设录制（KEYDOWN 事件路径 + get_pressed 轮询双保险，
                 # 内部 0.3 秒防抖防止两条路径重复触发同一次按键）
@@ -883,6 +1135,44 @@ class SoulPlayerApp:
                 # 语音触发监听切换
                 elif event.key == pygame.K_v and self._voice_rec is None:
                     self._toggle_voice_listening()
+                # 音乐列表开关
+                elif event.key == pygame.K_m:
+                    self._music_list_open = not self._music_list_open
+                    if self._music_list_open:
+                        self._music_list_scroll = 0
+                        if self.anim:
+                            self.anim.open_modal()
+                    else:
+                        if self.anim:
+                            self.anim.close_modal()
+
+    def _update_volume_from_mouse(self, mouse_x: int):
+        """根据鼠标 X 坐标设置音量（0.0~1.0），并触发数值回显弹标。"""
+        bar = getattr(self, '_vol_bar_rect', None)
+        if bar is None or bar.width <= 0:
+            return
+        vol = (mouse_x - bar.x) / bar.width
+        vol = min(1.0, max(0.0, vol))
+        try:
+            self.player.set_volume(vol)
+            self._vol_popup_until = time.time() + 1.2
+        except Exception:
+            pass
+
+    def _update_seek_from_mouse(self, mouse_x: int):
+        """根据鼠标 X 坐标计算并设置播放进度（0.0~1.0）。"""
+        seek_rect = getattr(self, '_seek_bar_rect', None)
+        if seek_rect is None or seek_rect.width <= 0:
+            return
+        progress = (mouse_x - seek_rect.x) / seek_rect.width
+        progress = min(1.0, max(0.0, progress))
+        try:
+            dur = self.player.get_track_duration()
+            if dur > 0:
+                self.player.seek_to(progress * dur)
+        except Exception:
+            pass
+
     def _update(self):
         """
         核心更新逻辑：
@@ -897,7 +1187,9 @@ class SoulPlayerApp:
         renaming = (self._renaming_preset is not None
                     or self._deleting_preset is not None
                     or self._song_select is not None
-                    or self._voice_rec is not None)
+                    or self._section_select is not None
+                    or self._voice_rec is not None
+                    or self._music_list_open)
 
         # R 键边沿检测
         r_now = keys[pygame.K_r] and not renaming
@@ -917,7 +1209,9 @@ class SoulPlayerApp:
         # 但弹窗打开时仍屏蔽）
         t_blocked = (self._renaming_preset is not None
                      or self._deleting_preset is not None
-                     or self._song_select is not None)
+                     or self._song_select is not None
+                     or self._section_select is not None
+                     or self._music_list_open)
         t_now = keys[pygame.K_t] and not t_blocked
         t_prev = getattr(self, '_t_key_prev', False)
         self._t_key_prev = t_now
@@ -1138,16 +1432,47 @@ class SoulPlayerApp:
         与 ARCHITECTURE.md 中 handle_action 定义保持一致。
         对瞬时动作（pause/play/next/prev）添加 1 秒冷却期，防止连续触发。
         """
+        # 挥手方向冷却（同向/反向分离）：
+        # - 同向冷却 0.35s：防止同方向机关枪式连发（match 每帧返回），
+        #   但间隔 >0.35s 的同向连续挥手可正常触发 → 连贯切歌不受影响；
+        # - 反向冷却 0.9s：挥完收手的"回正"是一次紧跟触发的反向横扫
+        #   （挥右切下一首后把手收回 = 向左横扫），若冷却太短会被误判为
+        #   "上一首"——"收手时最容易串成反向"的根因。0.9s 覆盖完整
+        #   收手过程（挥出+收回约 0.4~0.8s）；真正想切反方向需间隔 >0.9s，
+        #   与 direction 首段判定（motion_capture 侧）双保险。
+        _WAVE_ACTIONS = {"player_next", "player_prev"}
+        if action in _WAVE_ACTIONS:
+            now = time.time()
+            other = "player_prev" if action == "player_next" else "player_next"
+            last_same = self._action_cooldowns.get(action, 0.0)
+            last_other = self._action_cooldowns.get(other, 0.0)
+            if now - last_same < 0.35 or now - last_other < 0.9:
+                return
+            self._action_cooldowns[action] = now
+            # 挥手触发后同步屏蔽自定义：挥手的收手/回正余波与自定义动作
+            # 的轨迹/特征模板相近，若不屏蔽，余波会被识别为自定义动作
+            # 播放（"做通用动作却串自定义动作"的根因，与下方 custom_play
+            # 屏蔽 player_wave 形成双向隔离）。
+            self._action_cooldowns["custom_play"] = now
+
         # 瞬时动作冷却期：1 秒内不重复触发同一动作
         # custom_play 也在内：自定义条件在触发后仍会持续满足若干帧，
         # 不冷却会每帧重启歌曲（"机关枪"式重触发）
-        _COOLDOWN_ACTIONS = {"player_pause", "player_play", "player_next", "player_prev", "custom_play"}
+        _COOLDOWN_ACTIONS = {"player_pause", "player_play", "custom_play"}
         if action in _COOLDOWN_ACTIONS:
             now = time.time()
             last_trigger = self._action_cooldowns.get(action, 0.0)
             if now - last_trigger < 1.0:
                 return  # 冷却期内，忽略本次触发
             self._action_cooldowns[action] = now
+
+        # 自定义动作与挥手切歌互斥：自定义动作触发后 1 秒内屏蔽下一首/上一首。
+        # 自定义动作的收手/回正余波与挥手特征相似，若不屏蔽会被识别为挥手误切歌。
+        #（player_wave 旧共用 key 已拆分为 player_next/player_prev 双向）
+        if action == "custom_play":
+            _cw = time.time()
+            self._action_cooldowns["player_next"] = _cw
+            self._action_cooldowns["player_prev"] = _cw
 
         if action.startswith("mood_"):
             mood = action.replace("mood_", "")
@@ -1161,9 +1486,15 @@ class SoulPlayerApp:
         elif action == "player_play":
             self.player.play()
         elif action == "player_next":
-            self.player.next_track()
+            try:
+                self.player.next_track()
+            except Exception as e:
+                self._add_log(f"下一首失败: {e}")
         elif action == "player_prev":
-            self.player.previous_track()
+            try:
+                self.player.previous_track()
+            except Exception as e:
+                self._add_log(f"上一首失败: {e}")
         elif action == "custom_play":
             if self.custom_manager:
                 preset_name = self.preset_engine.active_preset
@@ -1171,8 +1502,17 @@ class SoulPlayerApp:
                     preset_name = getattr(preset_name, 'name', preset_name)
                 track = self.custom_manager.pick_track(preset_name)
                 if track:
-                    self.player.play_track(track)
-                    self._add_log(f"自定义播放: {os.path.basename(track)}")
+                    try:
+                        self.player.play_track(track)
+                        # 从录制时选择的起始段落开始播放
+                        start_pct = 0.0
+                        preset = self.custom_manager.get_preset(preset_name)
+                        if preset is not None:
+                            start_pct = getattr(preset, 'start_pct', 0.0) or 0.0
+                        self._seek_to_start_pct(start_pct)
+                        self._add_log(f"自定义播放: {os.path.basename(track)}")
+                    except Exception as e:
+                        self._add_log(f"播放失败: {e}")
                 else:
                     self._add_log("无有效歌曲")
         elif action.startswith("voice_play:"):
@@ -1182,14 +1522,42 @@ class SoulPlayerApp:
                 tracks = self.voice_trigger.get_tracks(phrase)
                 if tracks:
                     track = random.choice(tracks)
-                    self.player.play_track(track)
-                    self._add_log(f"🎤 台词 [{phrase}] 播放: {os.path.basename(track)}")
+                    try:
+                        self.player.play_track(track)
+                        # 从录制时选择的起始段落开始播放
+                        start_pct = self.voice_trigger.get_start_pct(phrase)
+                        self._seek_to_start_pct(start_pct)
+                        self._add_log(f"🎤 台词 [{phrase}] 播放: {os.path.basename(track)}")
+                    except Exception as e:
+                        self._add_log(f"播放失败: {e}")
                 else:
                     self._add_log(f"台词 [{phrase}] 没有关联歌曲")
         else:
             self._add_log(f"未知动作: {action}")
 
+    def _seek_to_start_pct(self, start_pct: float):
+        """按起始段落百分比（0.0~1.0）跳转到对应播放位置；0.0 或时长未知时忽略。"""
+        try:
+            if not start_pct:
+                return
+            duration = self.player.get_track_duration()
+            if duration and duration > 0:
+                self.player.seek_to(start_pct * duration)
+        except Exception:
+            pass
+
     # ---------- 语音监听控制 ----------
+
+    def _play_from_music_list(self, idx: int):
+        """从音乐列表弹窗播放指定索引曲目（保持弹窗打开，便于继续换歌）。"""
+        try:
+            self.player.play(idx)
+            track = self.player.current_track
+            title = (track.get('title') or track.get('filename')
+                     or f"曲目 {idx + 1}") if isinstance(track, dict) else f"曲目 {idx + 1}"
+            self._add_log(f"手动选择播放: {title}")
+        except Exception as e:
+            self._add_log(f"播放失败: {e}")
 
     def _toggle_voice_listening(self):
         """切换语音监听开关状态（V 键触发，0.3 秒防抖避免双路径重复触发）。"""
@@ -1249,7 +1617,7 @@ class SoulPlayerApp:
             self.recording_mode = True
             self.recording_preset_name = f"custom_{time.strftime('%H%M%S')}"
             self._countdown_done_notified = False  # 重置通知标志，确保下次录制会显示通知
-            self._add_log("⏳ 3秒后开始录制，请做好准备...")
+            self._add_log("⏳ 3秒倒计时：请保持静止（采集中性基线）... 屏幕提示符结束后开始做动作")
 
 
     def _update_recording(self):
@@ -1295,6 +1663,14 @@ class SoulPlayerApp:
         conditions = self.custom_manager.finish_recording()
         summary = self.custom_manager.get_recording_summary()
         self._add_log(f"录制完成: {summary}")
+
+        # 方案A：录制已同时采集"中性基线+动作模板"，触发端用距离匹配
+        # （距动作近、距静止基线远才触发），静止误触/判定点不足由匹配
+        # 逻辑天然免疫，不再需要 is_idle_matching / count_discriminators 硬校验。
+        # 此处仅兜底：完全没有动作样本时直接提示重新录制。
+        if not conditions.get("action"):
+            self._add_log("⚠️ 未采到有效动作样本，已取消保存（请重新录制）")
+            return
 
         # 打开界面内联选歌面板（替代 tkinter 文件对话框——
         # 打包成 exe 后 tkinter 对话框经常弹不出来/藏在窗口后面）
@@ -1415,10 +1791,10 @@ class SoulPlayerApp:
             "name": phrase if mode == "voice" else self.recording_preset_name,
             "conditions": conditions,
             "songs": songs,
-            "selected": set(range(len(songs))),  # 默认全选，点击可取消
+            "selected": set(),  # 默认无勾选：需手动选择，避免误绑全部歌曲
             "scroll": 0,
         }
-        self._add_log(f"🎵 请选择关联歌曲（点击切换勾选，Enter 确认 / Esc 取消）")
+        self._add_log(f"🎵 请选择关联歌曲（单选 1 首，点击选择，Enter 确认 / Esc 取消）")
 
     def _cancel_song_select(self):
         self._song_select = None
@@ -1435,17 +1811,79 @@ class SoulPlayerApp:
         if not tracks:
             self._add_log("未选择歌曲，预设未保存")
             return
-        if sel.get("mode") == "voice":
-            # 语音台词：保存 台词→歌曲 映射，识别到台词时随机播放其一
-            self.voice_trigger.add_trigger(sel["phrase"], "voice_play", tracks)
-            self._add_log(f"✅ 台词 [{sel['phrase']}] 已保存，关联 {len(tracks)} 首歌曲（按 V 开启监听后生效）")
+        # 打开段落选择（非强制步骤）
+        self._open_section_select(sel, tracks)
+
+    def _open_section_select(self, song_sel, tracks):
+        """打开录制后的段落选择覆盖层（非强制）。"""
+        self._section_select = {
+            "mode": song_sel.get("mode", "motion"),
+            "phrase": song_sel.get("phrase", ""),
+            "name": song_sel.get("name", ""),
+            "conditions": song_sel.get("conditions"),
+            "tracks": tracks,
+            "start_pct": 0.0,   # 默认从头开始（0.0~1.0）
+            "label": "从头播放",
+        }
+        self._add_log("🎵 请选择播放起始段落（Enter 确认 / Esc 跳过）")
+
+    def _section_select_set_start(self, pct: float, label: str = ""):
+        """设置段落选择的起始百分比。"""
+        if self._section_select is None:
+            return
+        # 自动映射常用标签
+        if not label:
+            preset_labels = {0.0: "从头播放", 0.15: "前奏结束", 0.30: "主歌开始",
+                             0.50: "副歌开始", 0.70: "第二段"}
+            label = preset_labels.get(round(pct, 2), f"{int(pct * 100)}%")
+        self._section_select["start_pct"] = pct
+        self._section_select["label"] = label
+        self._add_log(f"段落选择: {label}")
+
+    def _confirm_section_select(self):
+        """确认段落选择并保存预设/台词（start_pct 写入存储）。"""
+        sec = self._section_select
+        self._section_select = None
+        self._section_select_rects = []
+        if sec is None:
+            return
+        tracks = sec["tracks"]
+        start_pct = sec.get("start_pct", 0.0)
+        label = sec.get("label", "从头播放")
+        if sec.get("mode") == "voice":
+            self.voice_trigger.add_trigger(sec["phrase"], "voice_play", tracks, start_pct=start_pct)
+            self._add_log(f"✅ 台词 [{sec['phrase']}] 已保存，关联 {len(tracks)} 首歌曲，起始段落: {label}（按 V 开启监听后生效）")
             return
         preset = self.custom_manager.add_preset(
-            name=sel["name"],
-            conditions=sel["conditions"],
+            name=sec["name"],
+            conditions=sec["conditions"],
             tracks=tracks,
+            start_pct=start_pct,
         )
-        # 注入新预设到引擎
+        try:
+            self.preset_engine.add_preset(preset)
+            self._add_log(f"✅ 预设 [{preset.name}] 已保存，关联 {len(tracks)} 首歌曲，起始段落: {label}")
+        except ValueError:
+            self._add_log(f"⚠️ 预设 [{preset.name}] 已保存，但引擎中已有同名预设")
+
+    def _skip_section_select(self):
+        """跳过段落选择（默认从头播放）并保存。"""
+        sec = self._section_select
+        self._section_select = None
+        self._section_select_rects = []
+        if sec is None:
+            return
+        tracks = sec["tracks"]
+        if sec.get("mode") == "voice":
+            self.voice_trigger.add_trigger(sec["phrase"], "voice_play", tracks, start_pct=0.0)
+            self._add_log(f"✅ 台词 [{sec['phrase']}] 已保存，关联 {len(tracks)} 首歌曲（按 V 开启监听后生效）")
+            return
+        preset = self.custom_manager.add_preset(
+            name=sec["name"],
+            conditions=sec["conditions"],
+            tracks=tracks,
+            start_pct=0.0,
+        )
         try:
             self.preset_engine.add_preset(preset)
             self._add_log(f"✅ 预设 [{preset.name}] 已保存，关联 {len(tracks)} 首歌曲")
@@ -1456,10 +1894,11 @@ class SoulPlayerApp:
         sel = self._song_select
         if sel is None or not (0 <= index < len(sel["songs"])):
             return
+        # 单选：一次自定义动作只关联 1 首歌曲
         if index in sel["selected"]:
-            sel["selected"].discard(index)
+            sel["selected"].discard(index)   # 再次点击取消
         else:
-            sel["selected"].add(index)
+            sel["selected"] = {index}        # 选中当前项，替换之前的选择
 
     def _draw_song_select_overlay(self):
         """绘制选歌覆盖层（与重命名/删除弹窗同风格）。"""
@@ -1488,7 +1927,7 @@ class SoulPlayerApp:
         title = self._font('medium').render(title_text, True, accent)
         self.screen.blit(title, (box.x + 20, box.y + 14))
         sub = self._font('tiny').render(
-            f"预设 [{sel['name']}]  |  已选 {len(sel['selected'])}/{len(sel['songs'])} 首  |  滚轮翻页",
+            f"预设 [{sel['name']}]  |  已选 {len(sel['selected'])} 首（单选）  |  滚轮翻页",
             True, muted)
         self.screen.blit(sub, (box.x + 20, box.y + 46))
 
@@ -1549,37 +1988,244 @@ class SoulPlayerApp:
         hint = self._font('tiny').render("点击歌曲切换勾选  |  Enter 保存  |  Esc 取消", True, muted)
         self.screen.blit(hint, (box.x + 300, box.bottom - 38))
 
+    def _draw_music_list_overlay(self):
+        """绘制音乐列表弹窗（手动选歌播放，与选歌弹窗同风格）。"""
+        if not self._music_list_open:
+            self._music_list_rects = []
+            return
+
+        accent = SoulTheme.ACCENT if SoulTheme else self.COLOR_ACCENT
+        bg = SoulTheme.BG_PANEL if SoulTheme else self.COLOR_PANEL
+        bg_input = SoulTheme.BG_DEEP if SoulTheme else (25, 25, 25)
+        text_c = SoulTheme.TEXT_PRIMARY if SoulTheme else self.COLOR_TEXT
+        muted = SoulTheme.TEXT_MUTED if SoulTheme else self.COLOR_TEXT_DIM
+
+        # 弹窗入场动画：透明度淡入 + 从下方 24px 上滑（ease_out_back 轻微回弹）
+        anim_t = 1.0
+        if self.anim:
+            anim_t = float(getattr(self.anim.modal_in, 'value', 1.0))
+
+        # 半透明遮罩
+        overlay = pygame.Surface((self.WIN_WIDTH, self.WIN_HEIGHT), pygame.SRCALPHA)
+        overlay.fill((0, 0, 0, int(120 * anim_t)))
+        self.screen.blit(overlay, (0, 0))
+
+        # 面板（双层嵌套风格：玻璃层 + 强调色描边）
+        box = pygame.Rect(280, 90 + int((1 - anim_t) * 24), 720, 540)
+        if self.ui and SoulTheme:
+            self.ui.glass_panel(box, color=SoulTheme.BG_PANEL, alpha=235)
+            self.ui.corner_brackets(box, SoulTheme.BORDER_LIGHT, length=16)
+            self.ui.glow_rect(box, SoulTheme.ACCENT_GLOW, radius=16, glow=2)
+            pygame.draw.rect(self.screen, accent, box, 1, border_radius=16)
+        else:
+            pygame.draw.rect(self.screen, bg, box, border_radius=8)
+            pygame.draw.rect(self.screen, accent, box, 2, border_radius=8)
+
+        info = {}
+        try:
+            info = self.player.get_playlist_info()
+        except Exception:
+            pass
+        tracks = info.get("tracks", []) or []
+        current_idx = info.get("current_index", -1)
+
+        title = self._font('medium').render(f"{ICONS.get('music', '♪')} 音乐列表", True, accent)
+        self.screen.blit(title, (box.x + 20, box.y + 14))
+        sub = self._font('tiny').render(
+            f"共 {len(tracks)} 首  |  单击曲目立即播放  |  滚轮翻页  |  Esc 关闭",
+            True, muted)
+        self.screen.blit(sub, (box.x + 20, box.y + 46))
+
+        list_rect = pygame.Rect(box.x + 20, box.y + 70, 680, 400)
+        row_h = 28
+        visible = list_rect.height // row_h
+        max_scroll = max(0, len(tracks) - visible)
+        self._music_list_scroll = max(0, min(self._music_list_scroll, max_scroll))
+        mouse_pos = pygame.mouse.get_pos()
+
+        if not tracks:
+            hint = self._font('small').render("暂无曲目，请将音乐文件放入 music/ 文件夹", True, muted)
+            self.screen.blit(hint, hint.get_rect(center=list_rect.center))
+            self._music_list_rects = []
+        else:
+            old_clip = self.screen.get_clip()
+            self.screen.set_clip(list_rect)
+            self._music_list_rects = []
+            for row in range(visible):
+                idx = self._music_list_scroll + row
+                if idx >= len(tracks):
+                    break
+                y = list_rect.y + row * row_h
+                row_rect = pygame.Rect(list_rect.x, y, list_rect.width, row_h - 2)
+                hovered = row_rect.collidepoint(mouse_pos)
+                is_current = (idx == current_idx)
+                if hovered:
+                    pygame.draw.rect(self.screen, bg_input, row_rect, border_radius=4)
+                elif is_current:
+                    hl = pygame.Surface(row_rect.size, pygame.SRCALPHA)
+                    pygame.draw.rect(hl, (*accent, 40), hl.get_rect(), border_radius=4)
+                    self.screen.blit(hl, row_rect.topleft)
+                # 序号
+                num = self._font('tiny').render(f"{idx + 1:>3}", True, muted)
+                self.screen.blit(num, (row_rect.x + 4, y + 6))
+                # 播放中标记
+                icon_x = row_rect.x + 34
+                if is_current:
+                    mark = self._font('small').render(ICONS.get("play", "▶"), True, accent)
+                    self.screen.blit(mark, (icon_x, y + 5))
+                # 曲目名
+                name = tracks[idx]
+                if len(name) > 46:
+                    name = name[:43] + "..."
+                color = accent if is_current else (text_c if hovered else muted)
+                surf = self._font('small').render(name, True, color)
+                self.screen.blit(surf, (icon_x + 18, y + 5))
+                self._music_list_rects.append((row_rect, idx))
+            self.screen.set_clip(old_clip)
+
+            # 滚动条
+            if max_scroll > 0:
+                bar_h = max(30, int(list_rect.height * visible / len(tracks)))
+                bar_y = list_rect.y + int((list_rect.height - bar_h) * self._music_list_scroll / max_scroll)
+                pygame.draw.rect(self.screen, muted, (list_rect.right - 6, bar_y, 4, bar_h),
+                                 border_radius=2)
+
+        # 底部：关闭按钮
+        btn_close = pygame.Rect(box.x + 20, box.bottom - 46, 120, 32)
+        self._music_list_rects.append((btn_close, "close"))
+        hovered = btn_close.collidepoint(mouse_pos)
+        pygame.draw.rect(self.screen, bg_input, btn_close, border_radius=6)
+        pygame.draw.rect(self.screen, accent, btn_close, 2 if hovered else 1, border_radius=6)
+        btn_surf = self._font('small').render("关闭", True, accent)
+        self.screen.blit(btn_surf, btn_surf.get_rect(center=btn_close.center))
+
+        hint2 = self._font('tiny').render("当前播放曲目带 ▶ 标记，单击曲目即切换播放", True, muted)
+        self.screen.blit(hint2, (box.x + 160, box.bottom - 38))
+
+    def _draw_section_select_overlay(self):
+        """绘制段落选择覆盖层（选歌后的非强制步骤）。"""
+        if self._section_select is None:
+            self._section_select_rects = []
+            return
+
+        sec = self._section_select
+        accent = SoulTheme.ACCENT if SoulTheme else self.COLOR_ACCENT
+        bg = SoulTheme.BG_PANEL if SoulTheme else self.COLOR_PANEL
+        bg_input = SoulTheme.BG_DEEP if SoulTheme else (25, 25, 25)
+        text_c = SoulTheme.TEXT_PRIMARY if SoulTheme else self.COLOR_TEXT
+        muted = SoulTheme.TEXT_MUTED if SoulTheme else self.COLOR_TEXT_DIM
+
+        # 半透明遮罩
+        overlay = pygame.Surface((self.WIN_WIDTH, self.WIN_HEIGHT), pygame.SRCALPHA)
+        overlay.fill((0, 0, 0, 120))
+        self.screen.blit(overlay, (0, 0))
+
+        # 面板
+        box = pygame.Rect(340, 200, 600, 320)
+        pygame.draw.rect(self.screen, bg, box, border_radius=8)
+        pygame.draw.rect(self.screen, accent, box, 2, border_radius=8)
+
+        title = self._font('medium').render("选择播放起始段落（可选）", True, accent)
+        self.screen.blit(title, (box.x + 20, box.y + 14))
+        sub = self._font('tiny').render(
+            f"已选 {len(sec['tracks'])} 首歌曲  |  当前设置: {sec.get('label', '从头播放')}",
+            True, muted)
+        self.screen.blit(sub, (box.x + 20, box.y + 46))
+
+        mouse_pos = pygame.mouse.get_pos()
+        self._section_select_rects = []
+
+        # 预设段落按钮
+        presets = [
+            ("从头播放", 0.0, 100),
+            ("前奏结束", 0.15, 100),
+            ("主歌开始", 0.30, 100),
+            ("副歌开始", 0.50, 100),
+            ("第二段", 0.70, 100),
+        ]
+        btn_y = box.y + 80
+        for i, (label, pct, bw) in enumerate(presets):
+            bx = box.x + 20 + (i % 3) * (bw + 10)
+            by = btn_y + (i // 3) * 40
+            rect = pygame.Rect(bx, by, bw, 32)
+            selected = abs(sec.get("start_pct", 0.0) - pct) < 0.01
+            hovered = rect.collidepoint(mouse_pos)
+            pygame.draw.rect(self.screen, accent if selected else bg_input, rect, border_radius=6)
+            pygame.draw.rect(self.screen, accent, rect, 2 if hovered or selected else 1, border_radius=6)
+            surf = self._font('small').render(label, True, text_c if selected else (accent if hovered else muted))
+            self.screen.blit(surf, surf.get_rect(center=rect.center))
+            self._section_select_rects.append((rect, f"preset:{pct}"))
+
+        # 时间轴（可拖拽进度条）：点击或拖动滑块自由选择起始段落
+        timeline_y = box.y + 175
+        tl_rect = pygame.Rect(box.x + 20, timeline_y - 8, 560, 22)  # 点击/拖拽热区
+        pygame.draw.rect(self.screen, muted, (box.x + 20, timeline_y, 560, 6), border_radius=3)
+        start_pct = sec.get("start_pct", 0.0)
+        fill_w = int(560 * start_pct)
+        if fill_w > 0:
+            pygame.draw.rect(self.screen, accent, (box.x + 20, timeline_y, fill_w, 6), border_radius=3)
+        thumb_x = box.x + 20 + fill_w
+        # 滑块：悬停/拖拽时放大提示可交互
+        hover_tl = tl_rect.collidepoint(mouse_pos)
+        pygame.draw.circle(self.screen, accent, (thumb_x, timeline_y + 3),
+                           8 if (hover_tl or self._section_dragging) else 6)
+        pct_label = self._font('tiny').render(f"起始位置: {int(start_pct * 100)}%", True, muted)
+        self.screen.blit(pct_label, (box.x + 20, timeline_y + 18))
+        self._section_select_rects.append((tl_rect, "timeline"))
+
+        # 按钮：确认 / 跳过
+        btn_confirm = pygame.Rect(box.x + 20, box.bottom - 50, 120, 34)
+        btn_skip = pygame.Rect(box.x + 156, box.bottom - 50, 120, 34)
+        self._section_select_rects.append((btn_confirm, "confirm"))
+        self._section_select_rects.append((btn_skip, "skip"))
+        for rect, label, color in ((btn_confirm, "确认保存", accent), (btn_skip, "跳过", muted)):
+            hovered = rect.collidepoint(mouse_pos)
+            pygame.draw.rect(self.screen, bg_input, rect, border_radius=6)
+            pygame.draw.rect(self.screen, color, rect, 2 if hovered else 1, border_radius=6)
+            surf = self._font('small').render(label, True, color)
+            self.screen.blit(surf, surf.get_rect(center=rect.center))
+
+        hint = self._font('tiny').render("Enter 确认  |  Esc 跳过（默认从头播放）", True, muted)
+        self.screen.blit(hint, (box.x + 300, box.bottom - 42))
 
     def _render(self):
         """渲染一帧画面到屏幕"""
-        # 使用新主题背景色
+        # 使用新主题背景色（近黑深底）+ 环境辉光（Ethereal Glass 氛围）
         bg = SoulTheme.BG_DEEP if SoulTheme else self.COLOR_BG
         self.screen.fill(bg)
+        if self.ui is not None and hasattr(self.ui, 'ambient'):
+            self.screen.blit(self.ui.ambient, (0, 0))
 
         # 绘制顶部标题栏
         self._draw_header()
 
-        # 绘制左侧摄像头预览与特征面板
-        self._draw_camera_preview(40, 120)
-        self._draw_feature_panel(40, 380)
-
-        # 绘制右侧播放控制与预设列表
-        self._draw_player_panel(720, 120)
-        self._draw_preset_list(720, 320)
-        # 语音面板：有模板时向下扩展（每行 22px，最多 2 行），日志面板随之下移压缩
+        # ── 空壳三列布局 ──
+        # 左列：摄像头预览 + 系统遥测 + 常驻歌单
+        self._draw_camera_preview(16, 64)
+        self._draw_telemetry_panel(16, 356)
+        self._draw_playlist_panel(16, 420)
+        # 中列：播放控制 + 语音台词 + 底部页签
+        self._draw_player_panel(364, 64)
         vt_count = 0
         if self.voice_trigger is not None and hasattr(self.voice_trigger, 'list_templates'):
-            vt_count = min(len(self.voice_trigger.list_templates()), 2)
+            vt_count = min(len(self.voice_trigger.list_templates()), 3)
         voice_h = 70 + (vt_count * 22 + 6 if vt_count else 0)
-        self._draw_voice_trigger_panel(720, 500, voice_h)
-        log_y = 500 + voice_h + 10
-        self._draw_log_panel(720, log_y, max(60, 695 - log_y))
-
-        # 绘制自定义预设面板（新增）
-        self._draw_custom_preset_panel(40, 560)
+        self._draw_voice_trigger_panel(364, 234, voice_h)
+        tab_y = 234 + voice_h + 15
+        # 底部信息区：动作特征 / 事件日志 页签（折叠显示）
+        self._draw_bottom_tabs(364, tab_y, max(60, min(165, 690 - tab_y)))
+        # 右列：动作预设 + 自定义预设
+        self._draw_preset_list(936, 64)
+        self._draw_custom_preset_panel(936, 223)
 
         # 绘制底部帮助栏
         self._draw_footer()
+
+        # 绘制选歌覆盖层与段落选择覆盖层（模态，覆盖在普通 UI 之上）
+        self._draw_song_select_overlay()
+        self._draw_section_select_overlay()
+        # 音乐列表弹窗（模态，覆盖在最上层）
+        self._draw_music_list_overlay()
 
         # 绘制动作闪光特效
         if self.anim and self.anim.action_flash and self.anim.action_flash.is_active():
@@ -1603,12 +2249,12 @@ class SoulPlayerApp:
                 overlay = pygame.Surface((self.WIN_WIDTH, self.WIN_HEIGHT), pygame.SRCALPHA)
                 overlay.fill((0, 0, 0, 120))
                 self.screen.blit(overlay, (0, 0))
-                # 大数字倒计时
+                # 大数字倒计时（视觉提示符）
                 countdown_text = self._font('large').render(str(count), True, (255, 80, 80))
                 rect = countdown_text.get_rect(center=(self.WIN_WIDTH // 2, self.WIN_HEIGHT // 2))
                 self.screen.blit(countdown_text, rect)
-                # 提示文字
-                hint = self._font('small').render("准备录制...", True, (200, 200, 200))
+                # 提示文字：倒计时期保持静止采集中性基线
+                hint = self._font('small').render("保持静止（采集中性基线）...", True, (200, 200, 200))
                 h_rect = hint.get_rect(center=(self.WIN_WIDTH // 2, self.WIN_HEIGHT // 2 + 50))
                 self.screen.blit(hint, h_rect)
             elif self.custom_manager.is_recording():
@@ -1616,8 +2262,8 @@ class SoulPlayerApp:
                 rec_text = self._font('large').render("● REC", True, (255, 80, 80))
                 rect = rec_text.get_rect(center=(self.WIN_WIDTH // 2, self.WIN_HEIGHT // 2))
                 self.screen.blit(rec_text, rect)
-                # 提示按 R 结束
-                hint = self._font('small').render("按 R 结束录制", True, (200, 200, 200))
+                # 提示开始做动作（视觉提示符：REC 亮起即开始）+ 按 R 结束
+                hint = self._font('small').render("开始做动作！按 R 结束录制", True, (200, 200, 200))
                 h_rect = hint.get_rect(center=(self.WIN_WIDTH // 2, self.WIN_HEIGHT // 2 + 50))
                 self.screen.blit(hint, h_rect)
 
@@ -1659,16 +2305,38 @@ class SoulPlayerApp:
     # ---------- 各区域绘制方法 ----------
 
     def _draw_header(self):
-        """绘制标题栏（新主题）"""
+        """绘制标题栏（未来科技 HUD 版）"""
         if self.ui and SoulTheme:
-            # 标题带发光效果
-            title = self._font('large').render("SoulPlayer", True, SoulTheme.ACCENT)
-            self.screen.blit(title, (40, 22))
-            # 副标题
-            subtitle = self._font('medium').render(
-                "基于肢体动作捕捉的智能音乐播放器", True, SoulTheme.TEXT_SECONDARY
-            )
-            self.screen.blit(subtitle, (40, 65))
+            # HUD 字标（大写 + 强调色）
+            title = self._font('large').render("SOULPLAYER", True, SoulTheme.ACCENT)
+            self.screen.blit(title, (40, 16))
+            # 副标题（等宽风：小号灰色）
+            subtitle = self._font('tiny').render(
+                "BODY-CONTROLLED MUSIC · 基于肢体动作捕捉的智能音乐播放器", True,
+                SoulTheme.TEXT_MUTED)
+            self.screen.blit(subtitle, (42, 64))
+            # 右侧 HUD 状态条：CAM / VOICE / VOL（点指示 + 胶囊底色）
+            vol = getattr(self.player, '_volume', 0.5)
+            mic_ok = (self.voice_trigger is not None
+                      and getattr(self.voice_trigger, 'available', False))
+            cam_ok = bool(getattr(self.motion, 'is_running', False))
+            chips = [
+                ("CAM", SoulTheme.SUCCESS if cam_ok else SoulTheme.TEXT_MUTED,
+                 "●" if cam_ok else "○"),
+                ("VOICE", SoulTheme.SUCCESS if mic_ok else SoulTheme.TEXT_MUTED,
+                 "●" if mic_ok else "○"),
+                ("VOL", SoulTheme.TEXT_SECONDARY, f"{vol:.0%}"),
+            ]
+            cx = 1240
+            for name, col, val in reversed(chips):
+                chip_txt = f"{name} {val}"
+                chip_w = max(72, len(chip_txt) * 12 + 26)
+                chip_rect = pygame.Rect(cx - chip_w, 32, chip_w, 24)
+                self.ui.alpha_rect(chip_rect, (*SoulTheme.BG_PANEL, 180), radius=6)
+                pygame.draw.circle(self.screen, col, (chip_rect.x + 10, chip_rect.y + 12), 4)
+                self.ui.label(chip_rect.x + 19, chip_rect.y + 6, chip_txt,
+                              self._font('tiny'), color=col)
+                cx -= chip_w + 8
             # 渐变分隔线
             for i in range(40, 1240, 2):
                 t = (i - 40) / 1200
@@ -1683,15 +2351,42 @@ class SoulPlayerApp:
             )
             self.screen.blit(subtitle, (40, 68))
             pygame.draw.line(self.screen, self.COLOR_PANEL, (40, 105), (1240, 105), 2)
+            # 降级主题状态文字
+            vol = getattr(self.player, '_volume', 0.5)
+            mic_ok = (self.voice_trigger is not None
+                      and getattr(self.voice_trigger, 'available', False))
+            cam_ok = bool(getattr(self.motion, 'is_running', False))
+            status_txt = self._font('tiny').render(
+                f"语音{'开' if mic_ok else '关'} | 摄像头{'开' if cam_ok else '关'} | 音量 {vol:.0%}",
+                True, self.COLOR_TEXT_DIM)
+            self.screen.blit(status_txt, (1240 - status_txt.get_width(), 42))
 
     def _draw_camera_preview(self, x: int, y: int):
         """绘制摄像头预览窗口（新主题 + 骨架叠加）"""
         if self.ui and SoulTheme:
-            # 圆角玻璃面板
+            # 圆角玻璃面板 + HUD 角标 + 标识
             panel_rect = pygame.Rect(x, y, self.PREVIEW_W + 20, self.PREVIEW_H + 45)
             self.ui.glass_panel(panel_rect, radius=SoulTheme.RADIUS_PANEL)
+            self.ui.corner_brackets(panel_rect, SoulTheme.BORDER_LIGHT, length=12)
             self.ui.label(x + 12, y + 10, "摄像头预览", self._font('medium'),
                           color=SoulTheme.TEXT_SECONDARY)
+            self.ui.label(panel_rect.right - 12, y + 12, "CAM-01",
+                          self._font('tiny'), color=SoulTheme.ACCENT, anchor="topright")
+            # 骨架显隐切换按钮（面板标题栏右侧，避开 CAM-01 角标）
+            sk_on = self._skeleton_visible
+            sk_rect = pygame.Rect(panel_rect.right - 146, y + 10, 74, 20)
+            ok_c = SoulTheme.SUCCESS if SoulTheme else (0, 200, 100)
+            muted_c = SoulTheme.TEXT_MUTED if SoulTheme else (150, 150, 150)
+            sk_border = ok_c if sk_on else muted_c
+            if sk_on:
+                hl = pygame.Surface(sk_rect.size, pygame.SRCALPHA)
+                pygame.draw.rect(hl, (*ok_c, 26), hl.get_rect(), border_radius=3)
+                self.screen.blit(hl, sk_rect.topleft)
+            pygame.draw.rect(self.screen, sk_border, sk_rect, 1, border_radius=3)
+            sk_lbl = "🦴 骨架:显" if sk_on else "🦴 骨架:隐"
+            sk_surf = self._font('tiny').render(sk_lbl, True, ok_c if sk_on else muted_c)
+            self.screen.blit(sk_surf, sk_surf.get_rect(center=sk_rect.center))
+            self._skeleton_btn_rect = sk_rect
         else:
             pygame.draw.rect(self.screen, self.COLOR_PANEL, (x, y, self.PREVIEW_W + 20, self.PREVIEW_H + 40))
             label = self._font('medium').render("摄像头预览", True, self.COLOR_TEXT)
@@ -1713,14 +2408,43 @@ class SoulPlayerApp:
                     preview_rect = (x + 10, y + 38)
                     self.screen.blit(surf, preview_rect)
 
-                    # 骨架绘制已禁用（landmarks 与预览画面坐标不同步，暂时隐藏）
-                    # if self.current_features and draw_pose_skeleton and SoulTheme:
-                    #     landmarks = self.current_features.get('landmarks', [])
-                    #     if landmarks and len(landmarks) == 33:
-                    #         draw_pose_skeleton(self.screen, landmarks,
-                    #                            self.PREVIEW_W, self.PREVIEW_H,
-                    #                            line_color=SoulTheme.ACCENT,
-                    #                            line_width=2, dot_radius=3)
+                    # 内部 HUD 网格（叠加在画面上）
+                    if SoulTheme:
+                        grid_ov = pygame.Surface((self.PREVIEW_W, self.PREVIEW_H), pygame.SRCALPHA)
+                        for gx in range(0, self.PREVIEW_W, 28):
+                            pygame.draw.line(grid_ov, (*SoulTheme.GRID_DIM, 40),
+                                             (gx, 0), (gx, self.PREVIEW_H), 1)
+                        for gy in range(0, self.PREVIEW_H, 28):
+                            pygame.draw.line(grid_ov, (*SoulTheme.GRID_DIM, 40),
+                                             (0, gy), (self.PREVIEW_W, gy), 1)
+                        self.screen.blit(grid_ov, preview_rect)
+                    # 骨架叠加（MediaPipe 归一化坐标映射到预览尺寸，异常时静默跳过）
+                    if (self._skeleton_visible and self.current_features
+                            and draw_pose_skeleton and SoulTheme):
+                        landmarks = self.current_features.get('landmarks', [])
+                        try:
+                            if landmarks and len(landmarks) == 33:
+                                draw_pose_skeleton(self.screen, landmarks,
+                                                   self.PREVIEW_W, self.PREVIEW_H,
+                                                   line_color=SoulTheme.ACCENT,
+                                                   line_width=2, dot_radius=3,
+                                                   offset=preview_rect)
+                        except Exception:
+                            pass
+                        # 手部 21 点细骨架（HandLandmarker，虚拟博主式）
+                        if draw_hand_skeleton:
+                            for _hk in ('hand_landmarks_L', 'hand_landmarks_R'):
+                                _hp = self.current_features.get(_hk, []) or []
+                                if len(_hp) >= 21:
+                                    try:
+                                        draw_hand_skeleton(
+                                            self.screen, _hp,
+                                            self.PREVIEW_W, self.PREVIEW_H,
+                                            line_color=(255, 200, 80),
+                                            line_width=2, dot_radius=2,
+                                            offset=preview_rect)
+                                    except Exception:
+                                        pass
                 else:
                     placeholder = self._font('small').render("帧格式不支持", True,
                                                               SoulTheme.TEXT_MUTED if SoulTheme else self.COLOR_TEXT_DIM)
@@ -1734,13 +2458,103 @@ class SoulPlayerApp:
                                               SoulTheme.TEXT_MUTED if SoulTheme else self.COLOR_TEXT_DIM)
             self.screen.blit(err, (x + 10, y + 120))
 
-    def _draw_feature_panel(self, x: int, y: int):
-        """绘制动作特征数值面板（新主题 + 动画过渡）"""
-        if self.ui and SoulTheme:
-            self.ui.label(x, y, "动作特征", self._font('medium'), color=SoulTheme.TEXT_SECONDARY)
-        else:
-            label = self._font('medium').render("动作特征", True, self.COLOR_TEXT)
-            self.screen.blit(label, (x, y))
+    # ── HUD 系统遥测面板（空壳同款） ──
+    def _draw_telemetry_panel(self, x: int, y: int):
+        """HUD 系统遥测：FPS / LAT / THR（等宽数字）。"""
+        if not (self.ui and SoulTheme):
+            return
+        rect = pygame.Rect(x, y, 336, 56)
+        self.ui.alpha_rect(rect, (*SoulTheme.BG_PANEL, 180), radius=SoulTheme.RADIUS_PANEL)
+        self.ui.label(x + 12, y + 8, "SYS.TELEMETRY", self._font('tiny'),
+                      color=SoulTheme.TEXT_MUTED)
+        f = self._font('tiny')
+        fps = int(self.clock.get_fps())
+        vals = [(f"FPS {fps:03d}", SoulTheme.INFO),
+                (f"LAT {42 + int(8 * (time.time() % 1)):03d}ms", SoulTheme.WARNING),
+                ("THR 0.62", SoulTheme.SUCCESS)]
+        vx = x + 12
+        for s, c in vals:
+            self.ui.label(vx, y + 28, s, f, color=c)
+            vx += f.size(s)[0] + 18
+
+    # ── HUD 常驻歌单面板（空壳同款，真实曲目） ──
+    def _draw_playlist_panel(self, x: int, y: int):
+        """常驻歌单：真实曲目列表 + 滚轮滚动 + 当前播放高亮。"""
+        if not (self.ui and SoulTheme):
+            return
+        rect = pygame.Rect(x, y, 336, 178)
+        self.ui.alpha_rect(rect, (*SoulTheme.BG_PANEL, 200), radius=SoulTheme.RADIUS_PANEL)
+        self.ui.label(x + 16, y + 10, "♪ PLAYLIST.歌单", self._font('small'),
+                      color=SoulTheme.TEXT_PRIMARY)
+        info = {}
+        try:
+            info = self.player.get_playlist_info()
+        except Exception:
+            pass
+        tracks = info.get("tracks", []) or []
+        current_idx = info.get("current_index", -1)
+        self.ui.label(rect.right - 16, y + 14, f"{len(tracks)} TRACKS",
+                      self._font('tiny'), color=SoulTheme.TEXT_MUTED, anchor="topright")
+        mouse = pygame.mouse.get_pos()
+        VISIBLE = 5
+        row_h = 26
+        list_y = y + 44
+        list_h = VISIBLE * row_h
+        self._playlist_rect = pygame.Rect(x + 14, list_y, rect.width - 28, list_h)
+        max_scroll = max(0, len(tracks) - VISIBLE)
+        self._play_scroll = max(0, min(getattr(self, '_play_scroll', 0), max_scroll))
+        ry = list_y
+        for i in range(self._play_scroll, self._play_scroll + VISIBLE):
+            if i >= len(tracks):
+                break
+            name = tracks[i]
+            if isinstance(name, dict):
+                name = name.get('title', '?')
+            row = pygame.Rect(x + 14, ry, rect.width - 28, row_h - 4)
+            hovered = row.collidepoint(mouse)
+            current = (i == current_idx)
+            if current:
+                hl = pygame.Surface(row.size, pygame.SRCALPHA)
+                pygame.draw.rect(hl, (*SoulTheme.ACCENT, 26), hl.get_rect(), border_radius=4)
+                self.screen.blit(hl, row.topleft)
+                pygame.draw.rect(self.screen, SoulTheme.BORDER_LIGHT, row, 1, border_radius=4)
+            elif hovered:
+                hl = pygame.Surface(row.size, pygame.SRCALPHA)
+                pygame.draw.rect(hl, (*SoulTheme.ACCENT, 16), hl.get_rect(), border_radius=4)
+                self.screen.blit(hl, row.topleft)
+            mark = "▶" if current else f"{i + 1:02d}"
+            col = (SoulTheme.ACCENT if current
+                   else (SoulTheme.TEXT_PRIMARY if hovered else SoulTheme.TEXT_SECONDARY))
+            self.ui.label(row.x + 8, row.y + 5, mark, self._font('tiny'), color=col)
+            nm = str(name)
+            f = self._font('tiny')
+            if f.size(nm)[0] > row.w - 96:
+                while f.size(nm + "…")[0] > row.w - 96 and len(nm) > 1:
+                    nm = nm[:-1]
+                nm += "…"
+            self.ui.label(row.x + 46, row.y + 4, nm, f,
+                          color=SoulTheme.ACCENT if current else SoulTheme.TEXT_PRIMARY)
+            ry += row_h
+        if max_scroll > 0:
+            bar_x = rect.right - 10
+            bar_h = max(10, int(list_h * VISIBLE / len(tracks)))
+            bar_y = list_y + int((list_h - bar_h) * self._play_scroll / max_scroll)
+            pygame.draw.rect(self.screen, SoulTheme.BORDER, (bar_x, list_y, 3, list_h),
+                             border_radius=2)
+            pygame.draw.rect(self.screen, SoulTheme.ACCENT, (bar_x, bar_y, 3, bar_h),
+                             border_radius=2)
+
+    def _draw_feature_panel(self, x: int, y: int, title: bool = True):
+        """绘制动作特征数值面板（新主题 + 动画过渡）。
+
+        title=False 时仅绘制内容（供底部"动作特征"页签嵌入，标题由页签提供）。
+        """
+        if title:
+            if self.ui and SoulTheme:
+                self.ui.label(x, y, "动作特征", self._font('medium'), color=SoulTheme.TEXT_SECONDARY)
+            else:
+                label = self._font('medium').render("动作特征", True, self.COLOR_TEXT)
+                self.screen.blit(label, (x, y))
 
         if not self.current_features:
             hint_color = SoulTheme.TEXT_MUTED if SoulTheme else self.COLOR_TEXT_DIM
@@ -1765,24 +2579,25 @@ class SoulPlayerApp:
                 ("身体节奏", features.get('body_rhythm', 0.0)),
             ]
 
+        row_gap = 38 if title else 30
         for i, (name, value) in enumerate(items):
-            row_y = y + 30 + i * 38
+            row_y = y + (30 if title else 4) + i * row_gap
             if self.ui and SoulTheme:
                 # 标签
                 self.ui.label(x, row_y, name, self._font('small'), color=SoulTheme.TEXT_MUTED)
                 # 数值
-                self.ui.label(x + 100, row_y, f"{value:.2f}", self._font('small'),
+                self.ui.label(x + 80, row_y, f"{value:.2f}", self._font('small'),
                               color=SoulTheme.TEXT_PRIMARY)
-                # 渐变进度条
-                self.ui.gradient_bar(x + 160, row_y + 2, 200, 16, value)
+                # 渐变进度条（缩短以适应右侧布局）
+                self.ui.gradient_bar(x + 130, row_y + 2, 150, 16, value)
             else:
                 txt = self._font('small').render(f"{name}", True, self.COLOR_TEXT_DIM)
                 self.screen.blit(txt, (x, row_y))
                 val_txt = self._font('small').render(f"{value:.2f}", True, self.COLOR_TEXT)
-                self.screen.blit(val_txt, (x + 110, row_y))
-                bar_x = x + 160
-                pygame.draw.rect(self.screen, self.COLOR_BAR_BG, (bar_x, row_y, 200, 16))
-                bar_width = int(200 * float(np.clip(value, 0.0, 1.0)))
+                self.screen.blit(val_txt, (x + 90, row_y))
+                bar_x = x + 130
+                pygame.draw.rect(self.screen, self.COLOR_BAR_BG, (bar_x, row_y, 150, 16))
+                bar_width = int(150 * float(np.clip(value, 0.0, 1.0)))
                 color = self.COLOR_ACCENT if value > 0.3 else self.COLOR_BAR_LOW
                 if bar_width > 0:
                     pygame.draw.rect(self.screen, color, (bar_x, row_y, bar_width, 16))
@@ -1793,63 +2608,102 @@ class SoulPlayerApp:
         hand = features.get('hand_position', 'unknown')
         active = "是" if features.get('is_active') else "否"
         info_text = f"姿态: {posture}  |  手部: {hand}  |  活动: {active}"
+        info_y = y + (185 if title else 128)
         if SoulTheme:
-            self.ui.label(x, y + 185, info_text, self._font('tiny'), color=SoulTheme.TEXT_MUTED)
+            self.ui.label(x, info_y, info_text, self._font('tiny'), color=SoulTheme.TEXT_MUTED)
         else:
             info = self._font('tiny').render(info_text, True, self.COLOR_TEXT_DIM)
-            self.screen.blit(info, (x, y + 185))
+            self.screen.blit(info, (x, info_y))
 
     def _draw_player_panel(self, x: int, y: int):
-        """绘制播放器控制面板（新主题）"""
+        """绘制播放器控制面板（新主题 + 进度条）"""
+        panel_w = 560
+        panel_h = 160
         if self.ui and SoulTheme:
-            panel_rect = pygame.Rect(x, y, 520, 180)
+            panel_rect = pygame.Rect(x, y, panel_w, panel_h)
             self.ui.glass_panel(panel_rect, radius=SoulTheme.RADIUS_PANEL)
-            self.ui.label(x + 15, y + 12, "播放控制", self._font('medium'),
+            self.ui.label(x + 15, y + 10, "播放控制", self._font('medium'),
                           color=SoulTheme.TEXT_SECONDARY)
         else:
-            pygame.draw.rect(self.screen, self.COLOR_PANEL, (x, y, 520, 180))
+            pygame.draw.rect(self.screen, self.COLOR_PANEL, (x, y, panel_w, panel_h))
             title = self._font('medium').render("播放控制", True, self.COLOR_TEXT)
-            self.screen.blit(title, (x + 15, y + 12))
+            self.screen.blit(title, (x + 15, y + 10))
+
+        # 右上角：音乐列表按钮（点击打开歌单弹窗）
+        btn_rect = pygame.Rect(x + panel_w - 92, y + 8, 80, 26)
+        self._music_list_btn_rect = btn_rect
+        btn_hover = btn_rect.collidepoint(pygame.mouse.get_pos())
+        if self.ui and SoulTheme:
+            btn_bg = SoulTheme.BG_HOVER if btn_hover else SoulTheme.BG_CARD
+            self.ui.rounded_rect(btn_rect, btn_bg, radius=SoulTheme.RADIUS_BTN,
+                                 border=1,
+                                 border_color=SoulTheme.ACCENT if btn_hover else SoulTheme.BORDER_LIGHT)
+            self.ui.label(btn_rect.centerx, btn_rect.centery,
+                          f"{ICONS.get('music', '♪')} 歌单", self._font('small'),
+                          color=SoulTheme.ACCENT if btn_hover else SoulTheme.TEXT_SECONDARY,
+                          align="center")
+        else:
+            pygame.draw.rect(self.screen, self.COLOR_ACCENT, btn_rect, 1, border_radius=6)
+            btn_txt = self._font('small').render("♪ 歌单", True, self.COLOR_ACCENT)
+            self.screen.blit(btn_txt, btn_txt.get_rect(center=btn_rect.center))
 
         track = self.player.current_track
         track_title = track.get('title', '无曲目') if isinstance(track, dict) else '无曲目'
         if self.ui and SoulTheme:
-            self.ui.label(x + 15, y + 45, track_title, self._font('medium'),
+            self.ui.label(x + 15, y + 38, track_title, self._font('medium'),
                           color=SoulTheme.TEXT_PRIMARY)
         else:
             track_name = self._font('medium').render(f"{track_title}", True, self.COLOR_TEXT)
-            self.screen.blit(track_name, (x + 15, y + 45))
+            self.screen.blit(track_name, (x + 15, y + 38))
 
-        # 播放状态 + 图标
+        # 左侧：播放状态（播放中带呼吸脉冲点）
         status = "播放中" if self.player.is_playing else "已暂停"
         if self.ui and SoulTheme:
             status_color = SoulTheme.ACCENT if self.player.is_playing else SoulTheme.TEXT_MUTED
             icon = ICONS.get("play" if self.player.is_playing else "pause", "")
-            self.ui.label(x + 15, y + 75, f"{icon} {status}", self._font('small'),
+            if self.player.is_playing:
+                # 三角波呼吸：半径 4~7px 匀速脉动
+                breath = abs(2 * ((time.time() * 2) % 1) - 1)
+                pygame.draw.circle(self.screen, SoulTheme.ACCENT,
+                                   (x + 11, y + 72), 4 + int(3 * breath))
+            self.ui.label(x + 15, y + 66, f"{icon} {status}", self._font('small'),
                           color=status_color)
         else:
             status_color = self.COLOR_ACCENT if self.player.is_playing else self.COLOR_TEXT_DIM
             status_txt = self._font('small').render(status, True, status_color)
-            self.screen.blit(status_txt, (x + 15, y + 75))
+            self.screen.blit(status_txt, (x + 15, y + 66))
 
-        # 音量条
+        # 右侧：音量条
         vol = self.player._volume if hasattr(self.player, '_volume') else 0.5
         if self.ui and SoulTheme:
-            self.ui.label(x + 15, y + 105, f"{ICONS.get('volume_high', '')} 音量", self._font('small'),
+            self.ui.label(x + 330, y + 66, f"{ICONS.get('volume_high', '')} 音量", self._font('small'),
                           color=SoulTheme.TEXT_MUTED)
-            self.ui.gradient_bar(x + 80, y + 108, 150, 12, vol,
+            self.ui.gradient_bar(x + 390, y + 69, 120, 12, vol,
                                  bg_color=SoulTheme.BAR_BG)
-            self.ui.label(x + 240, y + 106, f"{vol:.0%}", self._font('tiny'),
+            self.ui.label(x + 520, y + 67, f"{vol:.0%}", self._font('tiny'),
                           color=SoulTheme.TEXT_MUTED)
         else:
             vol_label = self._font('small').render(f"音量", True, self.COLOR_TEXT_DIM)
-            self.screen.blit(vol_label, (x + 15, y + 105))
-            pygame.draw.rect(self.screen, self.COLOR_BAR_BG, (x + 60, y + 108, 150, 12))
-            vol_w = int(150 * vol)
+            self.screen.blit(vol_label, (x + 330, y + 66))
+            pygame.draw.rect(self.screen, self.COLOR_BAR_BG, (x + 390, y + 69, 120, 12))
+            vol_w = int(120 * vol)
             if vol_w > 0:
-                pygame.draw.rect(self.screen, self.COLOR_ACCENT, (x + 60, y + 108, vol_w, 12))
+                pygame.draw.rect(self.screen, self.COLOR_ACCENT, (x + 390, y + 69, vol_w, 12))
             vol_pct = self._font('tiny').render(f"{vol:.0%}", True, self.COLOR_TEXT_DIM)
-            self.screen.blit(vol_pct, (x + 220, y + 106))
+            self.screen.blit(vol_pct, (x + 520, y + 67))
+        # 音量条热区（点击/拖拽调节，每帧刷新）
+        self._vol_bar_rect = pygame.Rect(x + 388, y + 65, 126, 20)
+
+        # 进度条（可拖拽）
+        self._draw_seek_bar(x + 15, y + 95, panel_w - 30)
+
+        # 空状态引导：无曲目时提示放音乐（替代最近动作位置）
+        if not isinstance(track, dict) or not track.get('title'):
+            hint = self._font('small').render(
+                "暂无曲目：将音乐放入 music/ 文件夹，按 M 打开歌单", True,
+                SoulTheme.ACCENT if SoulTheme else self.COLOR_ACCENT)
+            self.screen.blit(hint, (x + 15, y + 130))
+            return
 
         # 最近触发动作（带闪烁效果）
         if self.last_action:
@@ -1857,12 +2711,11 @@ class SoulPlayerApp:
             alpha = max(50, 255 - int(age * 30))
             if self.ui and SoulTheme:
                 # 使用主题色但带透明度
-                faded = (*SoulTheme.ACCENT[:3], alpha)
                 action_text = f"{ICONS.get('sparkles', '')} 最近动作: {self.last_action}"
                 action_surf = self._font('small').render(action_text, True, SoulTheme.ACCENT)
                 # 创建带 alpha 的 surface
                 action_surf.set_alpha(alpha)
-                self.screen.blit(action_surf, (x + 15, y + 140))
+                self.screen.blit(action_surf, (x + 15, y + 130))
             else:
                 action_color = (
                     self.COLOR_ACCENT[0] * alpha // 255,
@@ -1870,7 +2723,97 @@ class SoulPlayerApp:
                     self.COLOR_ACCENT[2] * alpha // 255,
                 )
                 action_txt = self._font('small').render(f"最近动作: {self.last_action}", True, action_color)
-                self.screen.blit(action_txt, (x + 15, y + 140))
+                self.screen.blit(action_txt, (x + 15, y + 130))
+
+        # 音量数值回显弹标（按键调整后短暂显示，带淡出）
+        if time.time() < self._vol_popup_until:
+            vol = getattr(self.player, '_volume', 0.5)
+            remain = self._vol_popup_until - time.time()
+            pop_alpha = 255 if remain > 0.6 else int(255 * remain / 0.6)
+            pop_txt = f"{ICONS.get('volume_high', '🔊')} 音量 {vol:.0%}"
+            pop_surf = self._font('small').render(
+                pop_txt, True, SoulTheme.ACCENT if SoulTheme else self.COLOR_ACCENT)
+            pop_surf.set_alpha(max(40, pop_alpha))
+            pill = pygame.Rect(0, 0, pop_surf.get_width() + 24, 28)
+            pill.center = (x + panel_w // 2, y - 8)
+            if self.ui and SoulTheme:
+                self.ui.rounded_rect(pill, SoulTheme.BG_CARD, radius=14,
+                                     border=1, border_color=SoulTheme.ACCENT_DIM)
+            else:
+                pygame.draw.rect(self.screen, self.COLOR_PANEL, pill, border_radius=14)
+            self.screen.blit(pop_surf, pop_surf.get_rect(center=pill.center))
+
+    def _draw_seek_bar(self, x: int, y: int, width: int):
+        """绘制可拖拽的音频播放进度条（UI 占位，seek 后端待完善）。"""
+        bar_h = 10
+        thumb_r = 6
+        accent = SoulTheme.ACCENT if SoulTheme else self.COLOR_ACCENT
+        bg = SoulTheme.BAR_BG if SoulTheme else self.COLOR_BAR_BG
+        muted = SoulTheme.TEXT_MUTED if SoulTheme else self.COLOR_TEXT_DIM
+        text_c = SoulTheme.TEXT_PRIMARY if SoulTheme else self.COLOR_TEXT
+
+        # 获取播放进度（0.0~1.0），若无法获取则显示 0
+        progress = 0.0
+        try:
+            pos = self.player.get_playback_position()
+            dur = self.player.get_track_duration()
+            if dur > 0:
+                progress = min(1.0, max(0.0, pos / dur))
+        except Exception:
+            pass
+
+        mouse_pos = pygame.mouse.get_pos()
+        bar_rect = pygame.Rect(x, y, width, bar_h + 4)
+        # 悬停检测区域稍大
+        self._seek_hovered = bar_rect.collidepoint(mouse_pos)
+
+        # HUD 波形进度：伪波形柱（播放过=强调色）+ 播放头 + 悬停滑块
+        track_y = y + (bar_h // 2) + 2
+        fill_w = int(width * progress)
+        wav_h = bar_h + 4
+        bars = 120
+        for i in range(bars):
+            wf = 0.5 + 0.5 * abs(np.sin(i * 0.35 + time.time() * 3))
+            hgt = max(2, int(wav_h * wf))
+            bx = x + i * (width / bars)
+            done = (i / bars) <= progress
+            pygame.draw.rect(self.screen, accent if done else bg,
+                             (bx, track_y + (wav_h - hgt) // 2, 3, hgt))
+        # 播放头（竖线 + 三角）
+        hx = x + fill_w
+        pygame.draw.line(self.screen, text_c, (hx, track_y), (hx, track_y + wav_h), 2)
+        hds = pygame.Surface((9, 14), pygame.SRCALPHA)
+        pygame.draw.polygon(hds, (*accent, 230), [(0, 0), (9, 7), (0, 14)])
+        self.screen.blit(hds, (hx - 5, track_y - 2))
+        # 滑块（悬停或拖拽时显示）
+        if self._seek_hovered or self._seek_dragging:
+            thumb_x = x + fill_w
+            pygame.draw.circle(self.screen, accent, (thumb_x, track_y + bar_h // 2), thumb_r)
+
+        # 时间文本
+        try:
+            pos = self.player.get_playback_position()
+            dur = self.player.get_track_duration()
+            if dur > 0:
+                pos_str = f"{int(pos // 60)}:{int(pos % 60):02d}"
+                dur_str = f"{int(dur // 60)}:{int(dur % 60):02d}"
+                time_text = f"{pos_str} / {dur_str}"
+            else:
+                time_text = "--:-- / --:--"
+        except Exception:
+            time_text = "--:-- / --:--"
+        # 拖拽中时间文本用强调色（数值回显反馈）
+        if self._seek_dragging:
+            time_color = accent
+        elif self._seek_hovered:
+            time_color = text_c
+        else:
+            time_color = muted
+        time_surf = self._font('tiny').render(time_text, True, time_color)
+        self.screen.blit(time_surf, (x + width - time_surf.get_width(), y - 2))
+
+        # 注册进度条热区供事件处理使用（每帧刷新）
+        self._seek_bar_rect = bar_rect
 
     def _draw_preset_list(self, x: int, y: int):
         """绘制预设列表（新主题 + 脉冲高亮 + 高度自适应）"""
@@ -1880,14 +2823,20 @@ class SoulPlayerApp:
         panel_h = 38 + rows * 24 + 34
 
         if self.ui and SoulTheme:
-            panel_rect = pygame.Rect(x, y, 520, panel_h)
+            panel_rect = pygame.Rect(x, y, 328, panel_h)
             self.ui.glass_panel(panel_rect, radius=SoulTheme.RADIUS_PANEL)
             self.ui.label(x + 15, y + 12, "动作预设", self._font('medium'),
                           color=SoulTheme.TEXT_SECONDARY)
         else:
-            pygame.draw.rect(self.screen, self.COLOR_PANEL, (x, y, 520, panel_h))
+            pygame.draw.rect(self.screen, self.COLOR_PANEL, (x, y, 328, panel_h))
             title = self._font('medium').render("动作预设", True, self.COLOR_TEXT)
             self.screen.blit(title, (x + 15, y + 12))
+
+        # 空状态引导：无预设时提示录制
+        if not presets:
+            hint_color = SoulTheme.TEXT_MUTED if SoulTheme else self.COLOR_TEXT_DIM
+            hint = self._font('small').render("暂无预设：按 R 录制第一个自定义动作", True, hint_color)
+            self.screen.blit(hint, (x + 15, y + 52))
 
         col1_x = x + 15
         col2_x = x + 270
@@ -1944,7 +2893,7 @@ class SoulPlayerApp:
         if not self.voice_trigger:
             return
 
-        w = 520
+        w = 560
         status = self.voice_trigger.get_status()
 
         if self.ui and SoulTheme:
@@ -2001,38 +2950,147 @@ class SoulPlayerApp:
             hint = self._font('tiny').render("按 V 切换监听 | 按 T 录制台词", True, self.COLOR_TEXT_DIM)
             self.screen.blit(hint, (x + 15, y + 52))
 
-        # 语音模板列表（悬停显示删除按钮，最多显示 2 条）
+        # 语音模板列表（悬停显示编辑工具栏：改/删/收藏/左移/右移，支持滚动）
         self._voice_actions = []
         templates = []
         if hasattr(self.voice_trigger, 'list_templates'):
             templates = self.voice_trigger.list_templates()
+            # 按收藏+排序整理（与自定义预设一致）
+            templates.sort(key=lambda t: (-int(t.get("favorite", False)), t.get("order", 9999)))
         if templates:
             accent = SoulTheme.ACCENT if SoulTheme else self.COLOR_ACCENT
             text_c = SoulTheme.TEXT_PRIMARY if SoulTheme else self.COLOR_TEXT
             muted = SoulTheme.TEXT_MUTED if SoulTheme else self.COLOR_TEXT_DIM
             danger = SoulTheme.DANGER if SoulTheme else (220, 90, 90)
             mouse_pos = pygame.mouse.get_pos()
-            row_y = y + 70
-            for tpl in templates[:2]:
+            VISIBLE_ROWS = 3
+            row_h = 26
+            list_y = y + 70
+            list_h = VISIBLE_ROWS * row_h
+            self._voice_list_rect = pygame.Rect(x + 15, list_y, w - 30, list_h)
+            max_scroll = max(0, len(templates) - VISIBLE_ROWS)
+            self._voice_scroll = max(0, min(self._voice_scroll, max_scroll))
+            row_y = list_y
+            for tpl in templates[self._voice_scroll:self._voice_scroll + VISIBLE_ROWS]:
                 name = tpl["name"]
                 tc = tpl["track_count"]
-                row_rect = pygame.Rect(x + 15, row_y, w - 30, 20)
+                is_fav = tpl.get("favorite", False)
+                row_rect = pygame.Rect(x + 15, row_y, w - 30, 22)
                 hovered = row_rect.collidepoint(mouse_pos)
                 if hovered:
-                    pygame.draw.rect(self.screen, (255, 255, 255, 15), row_rect, border_radius=4)
-                label = self._font('tiny').render(f"🎵 {name}  ({tc} 首)", True,
-                                                  text_c if hovered else muted)
+                    # HUD 悬停：青辉高亮 + 高亮描边（SRCALPHA 临时表面保证真半透明）
+                    hl = pygame.Surface(row_rect.size, pygame.SRCALPHA)
+                    pygame.draw.rect(hl, (*accent, 34), hl.get_rect(), border_radius=4)
+                    self.screen.blit(hl, row_rect.topleft)
+                    pygame.draw.rect(self.screen,
+                                     SoulTheme.BORDER_LIGHT if SoulTheme else (150, 150, 150),
+                                     row_rect, 1, border_radius=4)
+                # 收藏左侧色条
+                if is_fav:
+                    pygame.draw.rect(self.screen, accent,
+                                     (row_rect.x, row_rect.y + 4, 3, row_rect.h - 8),
+                                     border_radius=2)
+                # 收藏标记 + 名称
+                fav_mark = "★ " if is_fav else ""
+                name_color = accent if is_fav else (text_c if hovered else muted)
+                label = self._font('tiny').render(f"{fav_mark}🎵 {name}  ({tc} 首)", True, name_color)
                 self.screen.blit(label, (row_rect.x + 4, row_rect.y + 3))
                 if hovered:
-                    btn = pygame.Rect(row_rect.right - 34, row_rect.y, 30, 18)
-                    pygame.draw.rect(self.screen, danger, btn, 1, border_radius=3)
-                    bsurf = self._font('tiny').render("删", True, danger)
-                    self.screen.blit(bsurf, bsurf.get_rect(center=btn.center))
-                    self._voice_actions.append((btn, name))
-                row_y += 22
-            if len(templates) > 2:
-                more = self._font('tiny').render(f"...共 {len(templates)} 条", True, muted)
-                self.screen.blit(more, (x + 19, row_y + 2))
+                    # 工具栏：改 / 删 / 收藏 / 左移 / 右移（与自定义预设卡片保持一致）
+                    btn_y = row_rect.y
+                    bx = row_rect.right - 140
+                    btn_specs = [
+                        ("改", "rename", 28, accent),
+                        ("删", "delete", 28, danger),
+                        ("★" if is_fav else "☆", "favorite", 28, accent),
+                        ("←", "move_left", 24, accent),
+                        ("→", "move_right", 24, accent),
+                    ]
+                    for lbl, act, bw, col in btn_specs:
+                        brect = pygame.Rect(bx, btn_y, bw, 20)
+                        bhover = brect.collidepoint(mouse_pos)
+                        if bhover:
+                            hl = pygame.Surface(brect.size, pygame.SRCALPHA)
+                            pygame.draw.rect(hl, (*accent, 50), hl.get_rect(), border_radius=3)
+                            self.screen.blit(hl, brect.topleft)
+                        pygame.draw.rect(self.screen, col, brect, 1, border_radius=3)
+                        bsurf = self._font('tiny').render(lbl, True, col)
+                        self.screen.blit(bsurf, bsurf.get_rect(center=brect.center))
+                        self._voice_actions.append((brect, name, act))
+                        bx += bw + 3
+                row_y += row_h
+            if max_scroll > 0:
+                bar_w = 3
+                bar_x = x + w - 12
+                track_h = list_h
+                bar_h = max(10, int(track_h * VISIBLE_ROWS / len(templates)))
+                bar_y = list_y + int((track_h - bar_h) * self._voice_scroll / max_scroll)
+                pygame.draw.rect(self.screen, muted, (bar_x, list_y, bar_w, track_h), border_radius=2)
+                pygame.draw.rect(self.screen, accent, (bar_x, bar_y, bar_w, bar_h), border_radius=2)
+
+    def _draw_bottom_tabs(self, x: int, y: int, h: int = 100):
+        """底部信息区页签面板：动作特征 / 事件日志 折叠切换。"""
+        self._bottom_tab_rects = []
+        panel_rect = pygame.Rect(x, y, 560, h)
+        if self.ui and SoulTheme:
+            self.ui.glass_panel(panel_rect, radius=SoulTheme.RADIUS_PANEL)
+        else:
+            pygame.draw.rect(self.screen, self.COLOR_PANEL, (x, y, 560, h))
+
+        # 页签栏（点击切换 + hover 缩放动效）
+        tabs = [("features", "动作特征"), ("log", "事件日志")]
+        tx = x + 15
+        mouse_pos = pygame.mouse.get_pos()
+        for key, label in tabs:
+            active = (self._bottom_tab == key)
+            base = pygame.Rect(tx, y + 8, 88, 24)
+            hovered = base.collidepoint(mouse_pos)
+            if self.ui and SoulTheme:
+                # hover 缩放动效：进度 0~1 平滑趋近（每帧指数插值），以中心放大
+                p = self._tab_anim[key]
+                target = 1.0 if (hovered or active) else 0.0
+                self._tab_anim[key] = p + (target - p) * 0.25
+                grow = int(5 * p)
+                tab_rect = base.inflate(grow * 2, grow * 2)
+                if p > 0.02:
+                    self.ui.glow_rect(tab_rect, SoulTheme.ACCENT_GLOW,
+                                      radius=SoulTheme.RADIUS_BTN, glow=2)
+                bg = SoulTheme.BG_HOVER if (active or hovered) else SoulTheme.BG_CARD
+                self.ui.rounded_rect(tab_rect, bg, radius=SoulTheme.RADIUS_BTN,
+                                     border=1,
+                                     border_color=SoulTheme.ACCENT if active else SoulTheme.BORDER_LIGHT)
+                self.ui.label(tab_rect.centerx, tab_rect.centery, label,
+                              self._font('small'),
+                              color=SoulTheme.ACCENT if active else SoulTheme.TEXT_MUTED,
+                              align="center")
+            else:
+                tab_rect = base
+                pygame.draw.rect(self.screen, self.COLOR_PANEL, tab_rect, border_radius=8)
+                tab_txt = self._font('small').render(
+                    label, True, self.COLOR_ACCENT if active else self.COLOR_TEXT_DIM)
+                self.screen.blit(tab_txt, (tx + 12, y + 14))
+            self._bottom_tab_rects.append((tab_rect, key))
+            tx += 96
+
+        # 内容区
+        content_y = y + 40
+        if self._bottom_tab == "features":
+            self._draw_feature_panel(x + 15, content_y, title=False)
+        else:
+            max_lines = max(1, min(4, (h - 48) // 17))
+            for i, (msg, t) in enumerate(self.log_messages[-max_lines:]):
+                age = time.time() - t
+                if age < 1.0:
+                    color = SoulTheme.ACCENT if SoulTheme else self.COLOR_ACCENT
+                elif age < 3.0:
+                    color = SoulTheme.TEXT_SECONDARY if SoulTheme else self.COLOR_TEXT_DIM
+                else:
+                    color = SoulTheme.TEXT_MUTED if SoulTheme else self.COLOR_TEXT_DIM
+                if self.ui and SoulTheme:
+                    self.ui.label(x + 15, content_y + i * 17, msg, self._font('tiny'), color=color)
+                else:
+                    line = self._font('tiny').render(msg, True, color)
+                    self.screen.blit(line, (x + 15, content_y + i * 17))
 
     def _draw_log_panel(self, x: int, y: int, h: int = 100):
         """绘制实时日志面板（新主题，高度可随语音面板扩展而压缩）"""
@@ -2065,14 +3123,29 @@ class SoulPlayerApp:
                 txt = self._font('tiny').render(msg, True, color)
                 self.screen.blit(txt, (x + 15, y + 38 + i * 17))
 
+    def _voice_status_hint(self, themed: bool):
+        """计算底部语音状态提示（新主题/降级主题共用，避免两处重复逻辑）"""
+        vt_status = self.voice_trigger.get_status()
+        mode = vt_status.get("mode") or "MFCC"
+        if vt_status.get("listening"):
+            return f"🎤 语音监听中（{mode}）", SoulTheme.SUCCESS if themed else (100, 200, 100)
+        if not self.voice_trigger.available:
+            if themed:
+                err = vt_status.get("last_error", "")[:20]
+                return f"🎤 语音未就绪: {err}...", SoulTheme.WARNING
+            return "🎤 语音未就绪", (200, 180, 80)
+        if themed:
+            return f"🎤 语音就绪（{mode}，按 V 开启）", SoulTheme.TEXT_MUTED
+        return f"🎤 按 V 开启语音监听（{mode}）", (170, 170, 170)
+
     def _draw_footer(self):
         """绘制底部帮助栏与帧率信息（新主题 + 录制动画）"""
         if SoulTheme:
             # 帮助信息
             help_text = (
-                f"{ICONS.get('arrow_left', '')}{ICONS.get('arrow_right', '')} 切歌  |  "
+                f"{ICONS.get('arrow_left', '')}{ICONS.get('arrow_right', '')} 下一首  |  "
                 f"{ICONS.get('arrow_up', '')}{ICONS.get('arrow_down', '')} 音量  |  "
-                f"空格 播放/暂停  |  R 录制  |  T 台词  |  V 语音  |  ESC 退出"
+                f"空格 播放/暂停  |  R 录制  |  T 台词  |  V 语音  |  M 歌单  |  ESC 退出"
             )
             self.ui.label(40, 692, help_text, self._font('tiny'), color=SoulTheme.TEXT_MUTED)
 
@@ -2099,17 +3172,7 @@ class SoulPlayerApp:
             else:
                 # 显示语音状态（优先）或录制快捷键提示
                 if self.voice_trigger is not None:
-                    vt_status = self.voice_trigger.get_status()
-                    if vt_status.get("listening"):
-                        hint = "🎤 语音监听中"
-                        hint_color = SoulTheme.SUCCESS
-                    elif not self.voice_trigger.available:
-                        err = vt_status.get("last_error", "")[:20]
-                        hint = f"🎤 语音未就绪: {err}..."
-                        hint_color = SoulTheme.WARNING
-                    else:
-                        hint = "🎤 语音就绪（按 V 开启）"
-                        hint_color = SoulTheme.TEXT_MUTED
+                    hint, hint_color = self._voice_status_hint(themed=True)
                     self.ui.label(1000, 695, hint, self._font('tiny'), color=hint_color)
                 else:
                     hint = f"按 R 录制自定义动作预设"
@@ -2122,7 +3185,7 @@ class SoulPlayerApp:
         else:
             # 降级：旧主题
             help_text = (
-                "快捷键:  [ESC/Q] 退出  |  [空格] 播放/暂停  |  [<-/->] 切歌  |  [上/下] 音量  |  [R] 录制预设  |  [T] 录制台词  |  [V] 语音监听"
+                "快捷键:  [ESC/Q] 退出  |  [空格] 播放/暂停  |  [<-/->] 下一首  |  [上/下] 音量  |  [R] 录制预设  |  [T] 录制台词  |  [V] 语音监听  |  [M] 歌单"
             )
             help_surf = self._font('tiny').render(help_text, True, (100, 100, 100))
             self.screen.blit(help_surf, (40, 695))
@@ -2132,16 +3195,7 @@ class SoulPlayerApp:
                 rec_surf = self._font('tiny').render(rec_text, True, (255, 80, 80))
                 self.screen.blit(rec_surf, (1000, 695))
             elif self.voice_trigger is not None:
-                vt_status = self.voice_trigger.get_status()
-                if vt_status.get("listening"):
-                    hint = "🎤 语音监听中"
-                    hint_color = (100, 200, 100)
-                elif not self.voice_trigger.available:
-                    hint = "🎤 语音未就绪"
-                    hint_color = (200, 180, 80)
-                else:
-                    hint = "🎤 按 V 开启语音监听"
-                    hint_color = (170, 170, 170)
+                hint, hint_color = self._voice_status_hint(themed=False)
                 hint_surf = self._font('tiny').render(hint, True, hint_color)
                 self.screen.blit(hint_surf, (1000, 695))
             fps = int(self.clock.get_fps())
@@ -2149,72 +3203,100 @@ class SoulPlayerApp:
             self.screen.blit(fps_txt, (1190, 695))
 
     def _draw_custom_preset_panel(self, x: int, y: int):
-        """绘制自定义预设快捷面板（新主题 + 悬停编辑工具栏）"""
+        """自定义预设面板（右列纵向卡片，空壳样式 + 悬停内联工具栏）"""
         if not self.custom_manager or not self.custom_manager.presets:
             self._custom_cards = []
             self._custom_actions = []
             return
 
-        w = 640
-        h = 80
+        w = 328
+        h = 250
         if self.ui and SoulTheme:
             panel_rect = pygame.Rect(x, y, w, h)
-            self.ui.glass_panel(panel_rect, radius=SoulTheme.RADIUS_CARD)
-            self.ui.label(x + 12, y + 8, f"{ICONS.get('sparkles', '')} 自定义预设", self._font('small'),
-                          color=SoulTheme.TEXT_SECONDARY)
+            self.ui.glass_panel(panel_rect, radius=SoulTheme.RADIUS_PANEL)
+            self.ui.label(x + 16, y + 10, "✧ CUSTOM.自定义", self._font('small'),
+                          color=SoulTheme.TEXT_PRIMARY)
         else:
             pygame.draw.rect(self.screen, self.COLOR_PANEL, (x, y, w, h))
             label = self._font('small').render("自定义预设", True, self.COLOR_TEXT)
             self.screen.blit(label, (x + 10, y + 8))
 
-        # 绘制每个自定义预设的快捷卡片（收藏项在前）
-        presets = self.custom_manager.get_display_presets()[:5]  # 最多显示5个
-        card_w = 115
-        card_h = 36
-        start_x = x + 12
-        card_y = y + 34
-
+        presets = self.custom_manager.get_display_presets()[:4]  # 右列最多 4 张
         mouse_pos = pygame.mouse.get_pos()
         self._custom_cards = []    # [(Rect, preset)] 供点击命中检测
         self._custom_actions = []  # [(Rect, action, preset)] 编辑按钮
         hovered_preset = None
 
-        for i, preset in enumerate(presets):
-            cx = start_x + i * (card_w + 8)
-            card_rect = pygame.Rect(cx, card_y, card_w, card_h)
-            self._custom_cards.append((card_rect, preset))
+        def track_title(p):
+            t = getattr(p, 'tracks', None)
+            if t:
+                try:
+                    return Path(str(t[0])).stem
+                except Exception:
+                    return "未绑定曲目"
+            return "未绑定曲目"
 
-            # 悬停检测：鼠标在卡片或卡片下方工具栏区域内都算悬停
-            toolbar_zone = pygame.Rect(cx, card_y + card_h + 2, 152, 28)
-            if card_rect.collidepoint(mouse_pos) or toolbar_zone.collidepoint(mouse_pos):
+        card_w = w - 28
+        card_h = 42
+        for i, preset in enumerate(presets):
+            card_rect = pygame.Rect(x + 14, y + 46 + i * 50, card_w, card_h)
+            self._custom_cards.append((card_rect, preset))
+            hovered = card_rect.collidepoint(mouse_pos)
+            if hovered:
                 hovered_preset = preset
 
-            # 收藏标记
             is_fav = getattr(preset, 'favorite', False)
             fav_mark = "★ " if is_fav else ""
-            name = preset.name[:8] + "..." if len(preset.name) > 8 else preset.name
+            nm = preset.name
+            f_tiny = self._font('tiny')
+            # 悬停时右侧留出内联工具栏空间
+            name_w = card_w - (150 if hovered else 16)
+            if f_tiny.size(nm)[0] > name_w:
+                while f_tiny.size(nm + "…")[0] > name_w and len(nm) > 1:
+                    nm = nm[:-1]
+                nm += "…"
 
             if self.ui and SoulTheme:
-                # 卡片背景（悬停时提亮）
-                bg = SoulTheme.BG_PANEL if hovered_preset is preset else SoulTheme.BG_CARD
+                bg = SoulTheme.BG_PANEL if hovered else SoulTheme.BG_CARD
+                if hovered:
+                    self.ui.glow_rect(card_rect, SoulTheme.ACCENT_GLOW,
+                                      radius=SoulTheme.RADIUS_BTN, glow=2)
                 self.ui.rounded_rect(card_rect, bg, radius=SoulTheme.RADIUS_BTN)
-                # 名称（收藏项带 ★ 且用强调色）
+                pygame.draw.rect(self.screen,
+                                 SoulTheme.BORDER_LIGHT if hovered else SoulTheme.BORDER,
+                                 card_rect, 1, border_radius=SoulTheme.RADIUS_BTN)
                 name_color = SoulTheme.ACCENT if is_fav else SoulTheme.TEXT_PRIMARY
-                self.ui.label(cx + 8, card_y + 4, f"{fav_mark}{name}", self._font('tiny'),
+                self.ui.label(card_rect.x + 10, card_rect.y + 5, f"{fav_mark}{nm}", f_tiny,
                               color=name_color)
-                # 歌曲数量
-                track_count = len(preset.tracks)
-                self.ui.label(cx + 8, card_y + 20, f"{ICONS.get('music', '')} {track_count}首",
-                              self._font('tiny'), color=SoulTheme.TEXT_MUTED)
+                self.ui.label(card_rect.x + 10, card_rect.y + 22,
+                              f"播放: {track_title(preset)}", f_tiny,
+                              color=SoulTheme.TEXT_MUTED)
             else:
                 pygame.draw.rect(self.screen, self.COLOR_PANEL, card_rect)
-                txt = self._font('tiny').render(f"{fav_mark}{name}", True, self.COLOR_TEXT_DIM)
-                self.screen.blit(txt, (cx + 5, card_y + 8))
+                txt = self._font('tiny').render(f"{fav_mark}{nm}", True, self.COLOR_TEXT_DIM)
+                self.screen.blit(txt, (card_rect.x + 5, card_rect.y + 8))
 
-        # 悬停卡片 → 在卡片下方显示编辑工具栏（改/删/藏/←/→）
-        if hovered_preset is not None:
-            card_rect = next(r for r, p in self._custom_cards if p is hovered_preset)
-            self._draw_preset_edit_toolbar(card_rect, hovered_preset, mouse_pos)
+            # 悬停 → 内联工具栏（改/删/★/←/→）
+            if hovered and self.ui and SoulTheme:
+                bx = card_rect.right - 132
+                btns = [("改", "rename", SoulTheme.TEXT_SECONDARY),
+                        ("删", "delete", SoulTheme.DANGER),
+                        ("★" if is_fav else "☆", "favorite", SoulTheme.ACCENT),
+                        ("←", "move_left", SoulTheme.TEXT_SECONDARY),
+                        ("→", "move_right", SoulTheme.TEXT_SECONDARY)]
+                for s, act, col in btns:
+                    bb = pygame.Rect(bx, card_rect.y + 9, 24, 24)
+                    bh = bb.collidepoint(mouse_pos)
+                    if bh:
+                        hl = pygame.Surface(bb.size, pygame.SRCALPHA)
+                        pygame.draw.rect(hl, (*SoulTheme.ACCENT, 50), hl.get_rect(), border_radius=3)
+                        self.screen.blit(hl, bb.topleft)
+                    pygame.draw.rect(self.screen, SoulTheme.BORDER_LIGHT, bb, 1,
+                                     border_radius=3)
+                    self.ui.label(bb.centerx, bb.centery, s, self._font('tiny'),
+                                  color=col, align="center")
+                    self._custom_actions.append((bb, act, preset))
+                    bx += 27
 
     def _draw_preset_edit_toolbar(self, card_rect: pygame.Rect, preset, mouse_pos):
         """在悬停的预设卡片下方绘制编辑工具栏，并注册按钮热区。"""
@@ -2247,7 +3329,7 @@ class SoulPlayerApp:
     def _handle_custom_preset_click(self, pos):
         """处理自定义预设编辑工具栏的鼠标点击。"""
         if (self._renaming_preset is not None or self._deleting_preset is not None
-                or self._song_select is not None):
+                or self._song_select is not None or self._section_select is not None):
             return  # 弹窗期间忽略面板点击
         for rect, action, preset in getattr(self, '_custom_actions', []):
             if not rect.collidepoint(pos):
@@ -2271,17 +3353,20 @@ class SoulPlayerApp:
             return
 
     def _rename_custom_preset(self, preset):
-        """进入界面内联重命名模式（不弹窗）。
+        """用 Tk 原生对话框重命名自定义预设。
 
-        输入期间临时开启 SDL 文本输入模式（中文输入法可用），
-        确认/取消后立即关闭，恢复 R/V 等字母快捷键的直达。
+        SDL 在 Windows 上无法显示微软拼音候选框（UILess 模式抑制，
+        Win11 22000+ 已知问题，hint 亦无效），内联输入等于盲打；
+        Tk 对话框是系统原生窗口，候选框必然正常显示（见
+        _ask_rename_dialog 说明）。Enter/Esc 后直接确认/取消。
         """
-        self._renaming_preset = preset
-        self._rename_text = preset.name
-        pygame.key.start_text_input()
-        # 把输入法候选框定位到输入框附近
-        pygame.key.set_text_input_rect(pygame.Rect(460, 335, 360, 34))
-        self._add_log(f"✏️ 正在重命名 [{preset.name}]（Enter 确认 / Esc 取消）")
+        new_name = self._ask_rename_dialog(preset)
+        if new_name:
+            self._renaming_preset = preset
+            self._rename_text = new_name
+            self._confirm_rename()
+        else:
+            self._add_log(f"✏️ 已取消重命名 [{preset.name}]")
 
     def _cancel_rename(self):
         """取消重命名，恢复快捷键。"""
@@ -2289,6 +3374,95 @@ class SoulPlayerApp:
         self._rename_text = ""
         pygame.key.stop_text_input()
         self._add_log("已取消重命名")
+
+    def _ask_rename_dialog(self, preset) -> Optional[str]:
+        """用主题化 Tk 原生输入对话框获取新名称（返回 None = 用户取消）。
+
+        背景：SDL 在 Windows 上无法显示微软拼音的 IME 候选框
+        （UILess 模式抑制原生候选 UI，Win11 22000+ 已知问题，hint
+        SDL_HINT_IME_SHOW_UI 亦无效），pygame 内联输入等于盲打。
+        Tk 对话框是系统原生窗口，微软拼音候选框必然正常显示；
+        为与主界面 UI 统一，对话框套用 SoulTheme 同款配色与微软雅黑
+        字体（深色面板 + 琥珀/青绿强调 + 输入框高亮边框）。
+        """
+        try:
+            import tkinter as tk
+        except Exception:
+            print("[DEBUG] Tk 输入对话框不可用，退回内联输入")
+            return None
+
+        is_voice = bool(getattr(preset, '_is_voice_template', False))
+        old_name = getattr(preset, 'name', '') or ''
+
+        # 与 pygame 主界面同款主题色（SoulTheme，缺省时回退类常量）
+        accent  = SoulTheme.ACCENT if SoulTheme else self.COLOR_ACCENT
+        bg      = SoulTheme.BG_DEEP if SoulTheme else self.COLOR_BG
+        panel   = SoulTheme.BG_PANEL if SoulTheme else self.COLOR_PANEL
+        text_c  = SoulTheme.TEXT_PRIMARY if SoulTheme else self.COLOR_TEXT
+        muted   = SoulTheme.TEXT_MUTED if SoulTheme else self.COLOR_TEXT_DIM
+        input_bg = SoulTheme.BG_DEEP if SoulTheme else (25, 25, 25)
+
+        def _hex(c):
+            return '#%02x%02x%02x' % (int(c[0]), int(c[1]), int(c[2]))
+
+        root = tk.Tk()
+        root.title("重命名台词" if is_voice else "重命名预设")
+        root.configure(bg=_hex(bg))
+        root.resizable(False, False)
+        root.attributes("-topmost", True)
+
+        # 居中于 pygame 窗口
+        W, H = 480, 196
+        px = self.WIN_WIDTH // 2 - W // 2
+        py = self.WIN_HEIGHT // 2 - H // 2
+        root.geometry(f"{W}x{H}+{px}+{py}")
+
+        f = "Microsoft YaHei UI"   # 与主界面 msyh.ttc 同族
+
+        # 面板容器
+        frame = tk.Frame(root, bg=_hex(panel), padx=24, pady=18)
+        frame.pack(fill="both", expand=True)
+
+        # 标题（强调色，与主界面面板标题一致）
+        tk.Label(frame, text="重命名台词" if is_voice else "重命名预设",
+                 bg=_hex(panel), fg=_hex(accent),
+                 font=(f, 13, "bold")).pack(anchor="w")
+
+        # 输入框（深底 + 强调色高亮边框，同主界面输入风格）
+        var = tk.StringVar(value=old_name)
+        entry = tk.Entry(frame, textvariable=var, bg=_hex(input_bg),
+                         fg=_hex(text_c), insertbackground=_hex(accent),
+                         relief="flat", font=(f, 13),
+                         highlightthickness=1,
+                         highlightbackground=_hex(accent),
+                         highlightcolor=_hex(accent))
+        entry.pack(fill="x", pady=(14, 10), ipady=6)
+        entry.focus_force()
+        root.update()
+        entry.select_range(0, tk.END)   # 全选旧名，直接输入即覆盖
+
+        # 提示行（次要文字色）
+        tk.Label(frame, text="Enter 确认  |  Esc 取消  |  支持中文输入",
+                 bg=_hex(panel), fg=_hex(muted),
+                 font=(f, 9)).pack(anchor="w")
+
+        result = {}
+
+        def _ok(_e=None):
+            result["val"] = var.get().strip()
+            root.destroy()
+
+        def _cancel(_e=None):
+            result["val"] = None
+            root.destroy()
+
+        entry.bind("<Return>", _ok)
+        entry.bind("<Escape>", _cancel)
+        root.protocol("WM_DELETE_WINDOW", _cancel)
+
+        root.wait_window(root)          # 模态阻塞，直到用户确认/取消
+        new_name = result.get("val")
+        return new_name or None
 
     def _confirm_rename(self):
         """确认重命名（同步引擎与存储），恢复快捷键。"""
@@ -2301,6 +3475,16 @@ class SoulPlayerApp:
         if preset is None or not new_name or new_name == preset.name:
             return
         old_name = preset.name
+
+        # 语音模板重命名
+        if getattr(preset, '_is_voice_template', False):
+            if self.voice_trigger is None:
+                return
+            if not self.voice_trigger.rename_trigger(old_name, new_name):
+                self._add_log(f"⚠️ 重命名失败：[{new_name}] 已存在")
+                return
+            self._add_log(f"✏️ 台词已重命名: {old_name} → {new_name}")
+            return
 
         if not self.custom_manager.rename_preset(old_name, new_name):
             self._add_log(f"⚠️ 重命名失败：[{new_name}] 已存在")
@@ -2338,7 +3522,8 @@ class SoulPlayerApp:
         pygame.draw.rect(self.screen, bg, box, border_radius=8)
         pygame.draw.rect(self.screen, accent, box, 2, border_radius=8)
 
-        title = self._font('medium').render("重命名预设", True, accent)
+        title_text = "重命名台词" if getattr(self._renaming_preset, '_is_voice_template', False) else "重命名预设"
+        title = self._font('medium').render(title_text, True, accent)
         self.screen.blit(title, (box.x + 20, box.y + 14))
 
         # 输入框（带闪烁光标）

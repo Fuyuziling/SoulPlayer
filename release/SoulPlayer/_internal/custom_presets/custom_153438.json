@@ -1,0 +1,31 @@
+{
+  "name": "custom_153438",
+  "description": "录制于 2026-08-08 15:34",
+  "conditions": {
+    "duration": 1.0,
+    "motion_energy": {
+      "min": 0.0,
+      "max": 0.05
+    },
+    "arm_motion_energy": {
+      "min": 0.0,
+      "max": 1.0
+    },
+    "body_rhythm": {
+      "min": 0.143,
+      "max": 0.789
+    },
+    "arm_horizontal_motion": {
+      "min": 0.0,
+      "max": 0.552
+    }
+  },
+  "action": "custom_play",
+  "priority": 20,
+  "tracks": [
+    "D:\\Users\\lenovo\\Documents\\Kimi\\Workspaces\\更有灵性的音乐播放器\\SoulPlayer\\music\\追求 ～追いつめられて／バリエーション.mp3"
+  ],
+  "favorite": false,
+  "order": 9999,
+  "start_pct": 0.0
+}

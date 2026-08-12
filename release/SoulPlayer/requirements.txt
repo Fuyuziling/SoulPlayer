@@ -1,0 +1,17 @@
+# SoulPlayer 依赖清单
+# 基于肢体动作捕捉 + 语音模板比对的智能音乐播放器
+
+# 计算机视觉（摄像头捕获与图像处理）
+opencv-python>=4.8.0
+
+# 人体姿态估计（Google MediaPipe Tasks API，需 0.10.x 以支持 pose_landmarker 模型）
+mediapipe>=0.10.30
+
+# 数值计算（MFCC 特征与 DTW 比对，纯 numpy 实现）
+numpy>=1.24.0
+
+# 音频播放与图形用户界面
+pygame>=2.5.0
+
+# 麦克风采集（语音模板录制与实时监听）
+sounddevice>=0.4.0
