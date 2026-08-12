@@ -26,55 +26,73 @@ import numpy as np
 class SoulTheme:
     """SoulPlayer 统一主题配置"""
 
-    # 背景层级
-    BG_DEEP     = (26, 26, 46)      # #1a1a2e 最深背景
-    BG_PANEL    = (30, 30, 56)      # #1e1e38 面板背景
-    BG_CARD     = (35, 35, 62)      # #23233e 卡片背景
-    BG_HOVER    = (42, 42, 72)      # #2a2a48 悬停背景
-    BG_INPUT    = (22, 22, 40)      # #161628 输入框背景
+    # 背景层级（近黑蓝绿冷底——未来科技 HUD）
+    BG_DEEP     = (6, 11, 15)       # 最深背景
+    BG_PANEL    = (10, 19, 25)      # 面板背景
+    BG_CARD     = (13, 24, 31)      # 卡片背景
+    BG_HOVER    = (18, 33, 42)      # 悬停背景
+    BG_INPUT    = (8, 15, 20)       # 输入框背景
 
-    # 文字层级
-    TEXT_PRIMARY   = (238, 238, 246)  # #eeeef6 主文字
-    TEXT_SECONDARY = (160, 160, 180)  # #a0a0b4 次要文字
-    TEXT_MUTED     = (100, 100, 120)  # #646478 提示文字
-    TEXT_ACCENT    = (0, 212, 170)    # #00d4aa 强调文字
+    # 文字层级（冷白 → 灰蓝）
+    TEXT_PRIMARY   = (216, 238, 240)
+    TEXT_SECONDARY = (132, 162, 172)
+    TEXT_MUTED     = (72, 102, 112)
+    TEXT_ACCENT    = (0, 226, 196)
 
-    # 强调色（灵性青绿）
-    ACCENT       = (0, 212, 170)     # #00d4aa
-    ACCENT_SOFT  = (0, 180, 145)     # #00b491
-    ACCENT_DIM   = (0, 140, 115)     # #008c73
-    ACCENT_GLOW  = (0, 212, 170, 80)  # 带透明度的发光色
+    # 强调色（灵魂青，HUD 化）
+    ACCENT       = (0, 226, 196)
+    ACCENT_SOFT  = (0, 180, 160)
+    ACCENT_DIM   = (0, 132, 118)
+    ACCENT_GLOW  = (0, 226, 196, 70)
 
     # 状态色
-    SUCCESS = (0, 212, 170)   # 青绿
-    WARNING = (255, 180, 0)   # 琥珀
-    DANGER  = (255, 90, 90)   # 柔和红
-    INFO    = (100, 180, 255) # 天蓝
+    SUCCESS = (0, 226, 196)
+    WARNING = (255, 196, 70)
+    DANGER  = (255, 76, 70)
+    INFO    = (84, 190, 255)
 
     # 进度条
-    BAR_BG      = (45, 45, 70)   # 背景条
-    BAR_LOW     = (80, 80, 110)  # 低值
-    BAR_MID     = (0, 180, 145)  # 中值
-    BAR_HIGH    = (0, 212, 170)  # 高值
-    BAR_GLOW    = (0, 212, 170, 120)  # 发光
+    BAR_BG      = (20, 38, 46)   # 背景条
+    BAR_LOW     = (60, 100, 110) # 低值
+    BAR_MID     = (0, 180, 160)  # 中值
+    BAR_HIGH    = (0, 226, 196)  # 高值
+    BAR_GLOW    = (0, 226, 196, 120)  # 发光
 
     # 边框与分隔
-    BORDER      = (50, 50, 78)   # 常规边框
-    BORDER_LIGHT = (65, 65, 95)  # 高亮边框
-    DIVIDER     = (40, 40, 65)   # 分隔线
+    BORDER      = (28, 56, 64)   # 常规边框
+    BORDER_LIGHT = (0, 168, 156) # 高亮边框（青）
+    DIVIDER     = (22, 46, 54)   # 分隔线
 
-    # 阴影
-    SHADOW_COLOR = (10, 10, 20, 100)  # 阴影色（带 alpha）
+    # HUD 网格 / 扫描线（背景氛围）
+    GRID        = (0, 78, 90)
+    GRID_DIM    = (0, 52, 62)
+    SCANLINE    = (0, 0, 0, 26)
+
+    # 阴影（柔和环境漫射）
+    SHADOW_COLOR = (0, 0, 8, 70)
+
+    # 发丝级边框（白 8~10% alpha）
+    HAIRLINE = (255, 255, 255, 26)
+    HAIRLINE_SOFT = (255, 255, 255, 14)
+    # 内层芯顶部受光高光
+    INSET_HIGHLIGHT = (255, 255, 255, 30)
+    # 双层嵌套（Double-Bezel）的外层壳底色（白 3%）
+    SHELL_BG = (255, 255, 255, 8)
+
+    # 环境辉光（背景氛围：青/蓝/紫三团微光，叠加网格）
+    GLOW_ACCENT = (0, 226, 196, 22)
+    GLOW_BLUE = (84, 190, 255, 16)
+    GLOW_PURPLE = (120, 90, 220, 14)
 
     # 圆角半径
-    RADIUS_PANEL = 12
-    RADIUS_CARD  = 8
-    RADIUS_BAR   = 4
-    RADIUS_BTN   = 6
+    RADIUS_PANEL = 10
+    RADIUS_CARD  = 6
+    RADIUS_BAR   = 6
+    RADIUS_BTN   = 4
 
     # 间距
-    PAD = 12
-    GAP = 8
+    PAD = 15
+    GAP = 10
 
 
 # ═══════════════════════════════════════════════════════
@@ -90,6 +108,34 @@ class UIRenderer:
     def __init__(self, screen: pygame.Surface):
         self.screen = screen
         self._shadow_cache: dict = {}  # 缓存阴影 Surface
+        # 环境辉光背景（Ethereal Glass）：预渲染一次，每帧直接 blit
+        self.ambient = self._build_ambient(screen.get_width(), screen.get_height())
+
+    def _build_ambient(self, w: int, h: int) -> pygame.Surface:
+        """预渲染 HUD 背景氛围：三团微光 + 网格线 + CRT 扫描线（一次生成，每帧 blit）。"""
+        surf = pygame.Surface((w, h), pygame.SRCALPHA)
+        # 三团径向微光（青/蓝/紫，保留原氛围基调）
+        orbs = [
+            (0.06, 0.05, 0.34, SoulTheme.GLOW_ACCENT),
+            (0.96, 0.10, 0.30, SoulTheme.GLOW_BLUE),
+            (0.12, 0.94, 0.30, SoulTheme.GLOW_PURPLE),
+        ]
+        for fx, fy, fr, color in orbs:
+            cx, cy = int(w * fx), int(h * fy)
+            r = int(max(w, h) * fr)
+            for i in range(r, 0, -3):
+                a = int(color[3] * (1.0 - i / r))
+                pygame.draw.circle(surf, (*color[:3], a), (cx, cy), i)
+        # 网格线（HUD 语言）
+        spacing = 48
+        for gx in range(0, w, spacing):
+            pygame.draw.line(surf, (*SoulTheme.GRID_DIM, 26), (gx, 0), (gx, h), 1)
+        for gy in range(0, h, spacing):
+            pygame.draw.line(surf, (*SoulTheme.GRID_DIM, 26), (0, gy), (w, gy), 1)
+        # CRT 扫描线（低 alpha，避免伤可读性）
+        for sy in range(0, h, 3):
+            pygame.draw.line(surf, (0, 0, 0, 22), (0, sy), (w, sy), 1)
+        return surf
 
     # ── 圆角矩形 ──
     def rounded_rect(self, rect: pygame.Rect, color: Tuple[int, int, int],
@@ -105,10 +151,10 @@ class UIRenderer:
         else:
             pygame.draw.rect(self.screen, color, rect, border_radius=radius)
 
-    # ── 阴影 ──
+    # ── 阴影（柔和环境漫射） ──
     def shadow(self, rect: pygame.Rect, radius: int = SoulTheme.RADIUS_PANEL,
-               blur: int = 10, offset: Tuple[int, int] = (0, 4)) -> None:
-        """在 rect 下方绘制柔和阴影"""
+               blur: int = 16, offset: Tuple[int, int] = (0, 6)) -> None:
+        """在 rect 下方绘制柔和阴影（低 alpha + 大 blur，模拟浮起感）"""
         cache_key = (rect.width, rect.height, radius, blur, offset)
         if cache_key not in self._shadow_cache:
             # 创建阴影 surface
@@ -127,17 +173,66 @@ class UIRenderer:
         shadow_surf = self._shadow_cache[cache_key]
         self.screen.blit(shadow_surf, (rect.x - blur + offset[0], rect.y - blur + offset[1]))
 
-    # ── 毛玻璃面板 ──
+    # ── 毛玻璃面板（双重嵌套 Double-Bezel） ──
     def glass_panel(self, rect: pygame.Rect, color: Tuple[int, int, int] = SoulTheme.BG_PANEL,
                     radius: int = SoulTheme.RADIUS_PANEL, alpha: int = 220) -> None:
-        """绘制半透明毛玻璃风格面板"""
-        # 创建带 alpha 的 surface
-        surf = pygame.Surface((rect.width, rect.height), pygame.SRCALPHA)
-        pygame.draw.rect(surf, (*color, alpha), (0, 0, rect.width, rect.height), border_radius=radius)
-        # 高光边框
-        pygame.draw.rect(surf, (*SoulTheme.BORDER_LIGHT, 60),
-                         (0, 0, rect.width, rect.height), border_radius=radius, width=1)
+        """绘制毛玻璃面板（外层壳 + 内层芯 + 发丝边框 + 顶部受光高光）。
+
+        结构（Double-Bezel，参考高级感设计规范）：
+        - 外层壳：白 3% 底色 + 白 10% 发丝外框（"光感"描边而非实色线框）；
+        - 内层芯：内容底色（color/alpha）+ 内圆角 + 顶部 1px 受光高光，
+          面板如"玻璃板嵌在托盘中"而非平铺在背景上。
+        """
+        w, h = rect.width, rect.height
+        pad = 5
+        surf = pygame.Surface((w, h), pygame.SRCALPHA)
+        # 外层壳
+        pygame.draw.rect(surf, SoulTheme.SHELL_BG, (0, 0, w, h), border_radius=radius)
+        pygame.draw.rect(surf, SoulTheme.HAIRLINE, (0, 0, w, h),
+                         width=1, border_radius=radius)
+        # 内层芯
+        inner = pygame.Rect(pad, pad, w - pad * 2, h - pad * 2)
+        pygame.draw.rect(surf, (*color, alpha), inner,
+                         border_radius=max(4, radius - pad))
+        # 顶部受光高光（避开圆角端点）
+        pygame.draw.line(surf, SoulTheme.INSET_HIGHLIGHT,
+                         (pad + 6, pad + 1), (w - pad - 6, pad + 1))
         self.screen.blit(surf, (rect.x, rect.y))
+
+    # ── HUD 半透明圆角矩形（SRCALPHA 安全） ──
+    def alpha_rect(self, rect: pygame.Rect, color: Tuple[int, ...], radius: int = 0) -> None:
+        """半透明圆角矩形：必须经 SRCALPHA 临时表面绘制（主屏无逐像素 alpha）。"""
+        if len(color) == 3:
+            pygame.draw.rect(self.screen, color, rect, border_radius=radius)
+            return
+        s = pygame.Surface(rect.size, pygame.SRCALPHA)
+        pygame.draw.rect(s, color, s.get_rect(), border_radius=radius)
+        self.screen.blit(s, rect.topleft)
+
+    # ── HUD 辉光描边（霓虹泛光） ──
+    def glow_rect(self, rect: pygame.Rect, color: Tuple[int, ...],
+                  radius: int = SoulTheme.RADIUS_BTN, glow: int = 2) -> None:
+        """多层半透明叠加描边，产生霓虹泛光感（HUD 核心语言）。"""
+        base = color[:3] if len(color) >= 3 else SoulTheme.ACCENT
+        for i in range(glow, 0, -1):
+            a = int(26 * (glow - i + 1) / glow)
+            r = rect.inflate(i * 4, i * 4)
+            self.alpha_rect(r, (*base, a), radius=radius + i * 2)
+
+    # ── HUD 四角角标（瞄准镜） ──
+    def corner_brackets(self, rect: pygame.Rect,
+                        color: Tuple[int, int, int] = SoulTheme.BORDER_LIGHT,
+                        length: int = 12, width: int = 2) -> None:
+        """四角框标（瞄准镜角标）：HUD 语言标志性元素。"""
+        x, y, w, h = rect
+        pts = [
+            [(x, y + length), (x, y), (x + length, y)],
+            [(x + w - length, y), (x + w, y), (x + w, y + length)],
+            [(x, y + h - length), (x, y + h), (x + length, y + h)],
+            [(x + w - length, y + h), (x + w, y + h), (x + w, y + h - length)],
+        ]
+        for seg in pts:
+            pygame.draw.lines(self.screen, color, False, seg, width)
 
     # ── 渐变进度条 ──
     def gradient_bar(self, x: int, y: int, width: int, height: int, progress: float,
@@ -215,11 +310,13 @@ class UIRenderer:
     # ── 文字标签 ──
     def label(self, x: int, y: int, text: str, font: pygame.font.Font,
               color: Tuple[int, int, int] = SoulTheme.TEXT_PRIMARY,
-              align: str = "left") -> pygame.Rect:
-        """绘制文字标签，返回文字区域"""
+              align: str = "left", anchor: Optional[str] = None) -> pygame.Rect:
+        """绘制文字标签，返回文字区域。anchor 支持 Rect 锚点（topright/center/…），优先于 align。"""
         surf = font.render(text, True, color)
         rect = surf.get_rect()
-        if align == "center":
+        if anchor:
+            setattr(rect, anchor, (x, y))
+        elif align == "center":
             rect.center = (x, y)
         elif align == "right":
             rect.right = x
@@ -312,22 +409,32 @@ CONNECTION_COLORS = {
 def draw_pose_skeleton(surface: pygame.Surface, landmarks: List[dict],
                        frame_w: int, frame_h: int,
                        line_color: Tuple[int, int, int] = SoulTheme.ACCENT,
-                       line_width: int = 2, dot_radius: int = 3) -> None:
+                       line_width: int = 2, dot_radius: int = 3,
+                       offset=(0, 0)) -> None:
     """
     在 surface 上绘制 MediaPipe 33 点骨架。
 
     Args:
         landmarks: 33 个关键点字典列表，每个含 x, y, visibility
         frame_w, frame_h: 摄像头帧的实际尺寸（用于坐标映射）
+        offset: (ox, oy) 画面在 surface 上的位置（预览框偏移）
     """
     if not landmarks or len(landmarks) < 33:
         return
 
-    # 映射到屏幕坐标
+    ox, oy = offset
+    # 映射到屏幕坐标（骨架 x 镜像 + 下移 + 水平跟随：画面保持原始视角）
+    s11, s12 = landmarks[11], landmarks[12]
+    # 垂直：肩膀基准线平移到画面底端
+    dy = 1.0 - (s11.get("y", 0) + s12.get("y", 0)) / 2.0
+    # 水平：以肩膀中心为锚，镜像后骨架整体跟随用户左右移动
+    # px = (2*cx - x) * frame_w：中心跟随用户位置，姿态绕中心镜像（照镜子）
+    cx = (s11.get("x", 0) + s12.get("x", 0)) / 2.0
+    dx = (2.0 * cx - 1.0) * frame_w
     points = []
     for lm in landmarks:
-        px = int(lm.get("x", 0) * frame_w)
-        py = int(lm.get("y", 0) * frame_h)
+        px = int(ox + (1.0 - lm.get("x", 0)) * frame_w + dx)
+        py = int(oy + (lm.get("y", 0) + dy) * frame_h)
         vis = lm.get("visibility", 0)
         points.append((px, py, vis))
 
@@ -346,10 +453,88 @@ def draw_pose_skeleton(surface: pygame.Surface, landmarks: List[dict],
             pygame.draw.circle(surface, line_color, (px, py), dot_radius)
             pygame.draw.circle(surface, (255, 255, 255), (px, py), max(1, dot_radius - 1))
 
+    # ── 手部增强（轻量版：不依赖新模型，用 Pose 手部 5 点表达手型） ──
+    # 手部关键点：腕 15/16、小指 17/18、食指 19/20、拇指 21/22
+    # 三根手指线异色加粗 + 指尖圆点 + 腕部张开度状态圆环（绿=张开 / 黄=半开 / 红=握拳）
+    for wrist, pinky, index, thumb in ((15, 17, 19, 21), (16, 18, 20, 22)):
+        wp = points[wrist]
+        if wp[2] <= 0.5:
+            continue
+        for tip, col in ((thumb, (255, 200, 80)),       # 拇指：琥珀
+                         (index, (84, 190, 255)),       # 食指：亮蓝
+                         (pinky, (255, 140, 160))):     # 小指：粉红
+            tp = points[tip]
+            if tp[2] > 0.5:
+                pygame.draw.line(surface, col, (wp[0], wp[1]), (tp[0], tp[1]),
+                                 line_width + 2)
+                pygame.draw.circle(surface, col, (tp[0], tp[1]), dot_radius + 2)
+                pygame.draw.circle(surface, (255, 255, 255), (tp[0], tp[1]),
+                                   dot_radius + 1, 1)
+        # 张开度：食指-小指间距 / 框宽 → 0~1
+        ip, pp = points[index], points[pinky]
+        if ip[2] > 0.5 and pp[2] > 0.5:
+            spread = ((ip[0] - pp[0]) ** 2 + (ip[1] - pp[1]) ** 2) ** 0.5
+            openness = max(0.0, min(1.0, spread / (0.28 * frame_w)))
+            ring_col = (0, 226, 196) if openness > 0.5 else \
+                       (255, 196, 70) if openness > 0.22 else (255, 76, 70)
+            rr = 7 + int(9 * openness)
+            ring = pygame.Surface((rr * 2, rr * 2), pygame.SRCALPHA)
+            pygame.draw.circle(ring, (*ring_col, 160), (rr, rr), rr, 2)
+            surface.blit(ring, (wp[0] - rr, wp[1] - rr))
+
 
 # ═══════════════════════════════════════════════════════
 # 运动可视化
 # ═══════════════════════════════════════════════════════
+
+# MediaPipe Hands 21 点骨架连线（每只手，虚拟博主式细骨架）
+HAND_CONNECTIONS = [
+    # 拇指：腕0 → 根1 → 掌2 → 指节3 → 尖4
+    (0, 1), (1, 2), (2, 3), (3, 4),
+    # 食指：腕0 → 根5 → 中6 → 末7 → 尖8
+    (0, 5), (5, 6), (6, 7), (7, 8),
+    # 中指：腕0 → 根9 → 中10 → 末11 → 尖12
+    (0, 9), (9, 10), (10, 11), (11, 12),
+    # 无名指：腕0 → 根13 → 中14 → 末15 → 尖16
+    (0, 13), (13, 14), (14, 15), (15, 16),
+    # 小指：腕0 → 根17 → 中18 → 末19 → 尖20
+    (0, 17), (17, 18), (18, 19), (19, 20),
+    # 指根横连（手掌）
+    (5, 9), (9, 13), (13, 17),
+]
+
+
+def draw_hand_skeleton(surface: pygame.Surface, hand_pts: List[dict],
+                       frame_w: int, frame_h: int,
+                       line_color: Tuple[int, int, int] = (255, 200, 80),
+                       line_width: int = 2, dot_radius: int = 2,
+                       offset=(0, 0)) -> None:
+    """
+    在 surface 上绘制一只手（MediaPipe Hands 21 点细骨架）。
+
+    手部坐标与 Pose 同一坐标系（归一化 0~1 相对整帧），
+    绘制时做 x 镜像（与画面/骨架同向）并加上预览框偏移。
+
+    Args:
+        hand_pts: 21 个关键点字典列表，每个含 x, y
+        frame_w, frame_h: 摄像头帧尺寸
+        offset: (ox, oy) 画面在 surface 上的位置
+    """
+    if not hand_pts or len(hand_pts) < 21:
+        return
+    ox, oy = offset
+    pts = []
+    for lm in hand_pts:
+        px = int(ox + (1.0 - lm.get("x", 0)) * frame_w)
+        py = int(oy + lm.get("y", 0) * frame_h)
+        pts.append((px, py))
+    for a, b in HAND_CONNECTIONS:
+        if a < len(pts) and b < len(pts):
+            pygame.draw.line(surface, line_color, pts[a], pts[b], line_width)
+    for px, py in pts:
+        pygame.draw.circle(surface, line_color, (px, py), dot_radius)
+        pygame.draw.circle(surface, (255, 255, 255), (px, py), max(1, dot_radius - 1))
+
 
 def draw_motion_trail(surface: pygame.Surface, landmarks_history: List[List[dict]],
                       frame_w: int, frame_h: int, color: Tuple[int, int, int] = SoulTheme.ACCENT) -> None:

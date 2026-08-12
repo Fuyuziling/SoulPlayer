@@ -377,6 +377,9 @@ class AnimationManager:
         self.recording = RecordingIndicator(duration=recording_duration)
         self.preset_pulse = PulseEffect(period=1.2, min_scale=1.0, max_scale=1.08)
         self.action_flash: Optional[ActionFlash] = None
+        # 弹窗入场动画：0→1（ease_out_back 轻微回弹）；默认置于完成态
+        self.modal_in = ValueAnimator(duration=0.25, easing=Easing.ease_out_back)
+        self.modal_in.snap_to(1.0)
 
         # 时间跟踪
         self._last_time = time.time()
@@ -393,6 +396,7 @@ class AnimationManager:
         self.feature_bars.update(dt)
         self.recording.update(dt)
         self.preset_pulse.update(dt)
+        self.modal_in.update(dt)
 
         if self.action_flash:
             self.action_flash.update(dt)
@@ -403,6 +407,15 @@ class AnimationManager:
         """在指定位置触发动作闪光"""
         self.action_flash = ActionFlash(x, y, max_radius=80, duration=0.6)
         self.action_flash.trigger()
+
+    # ── 弹窗入场动画 ──
+    def open_modal(self) -> None:
+        """播放弹窗入场动画（淡入 + 上滑 + 轻微回弹）"""
+        self.modal_in.set_target(1.0)
+
+    def close_modal(self) -> None:
+        """弹窗关闭动画（值回落到 0）"""
+        self.modal_in.set_target(0.0)
 
     def get_feature_animated(self, key: str) -> float:
         """获取平滑后的特征值"""

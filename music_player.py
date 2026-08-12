@@ -21,6 +21,10 @@ from typing import List, Optional
 
 import pygame.mixer
 
+# pygame.mixer.music 非线程安全：主线程的控制调用与淡入淡出 worker 线程
+# 统一经过该锁串行化，避免 SDL_mixer 并发访问导致崩溃/死锁/音量异常。
+_MIXER_LOCK = threading.RLock()
+
 
 # ---------------------------------------------------------------------------
 #  常量
@@ -38,6 +42,149 @@ MOOD_SUBDIR_MAP = {
     "party": "party",
     "relaxed": "relaxed",
 }
+
+
+# ---------------------------------------------------------------------------
+#  音频时长解析（纯标准库实现，避免引入 mutagen 等第三方依赖）
+# ---------------------------------------------------------------------------
+def _parse_wav_duration(path: str) -> float:
+    """WAV：通过采样帧数与采样率计算时长。"""
+    import wave
+    with wave.open(path, "rb") as wf:
+        frames = wf.getnframes()
+        rate = wf.getframerate()
+        return frames / rate if rate > 0 else -1.0
+
+
+def _parse_flac_duration(path: str) -> float:
+    """FLAC：读取 STREAMINFO 元数据块中的总采样数与采样率。"""
+    with open(path, "rb") as f:
+        if f.read(4) != b"fLaC":
+            return -1.0
+        while True:
+            header = f.read(4)
+            if len(header) < 4:
+                return -1.0
+            is_last = bool(header[0] & 0x80)
+            block_type = header[0] & 0x7F
+            length = int.from_bytes(header[1:4], "big")
+            payload = f.read(length)
+            if block_type == 0 and len(payload) >= 18:  # STREAMINFO
+                # sample rate 占 20 位，total samples 占 36 位（紧随其后）
+                sr = (payload[10] << 12) | (payload[11] << 4) | (payload[12] >> 4)
+                total = ((payload[12] & 0x0F) << 32) | (payload[13] << 24) | (
+                    payload[14] << 16) | (payload[15] << 8) | payload[16]
+                return total / sr if sr > 0 else -1.0
+            if is_last:
+                return -1.0
+
+
+def _parse_ogg_duration(path: str) -> float:
+    """OGG：首页面取采样率，末页面 granule position 取总采样数。"""
+    with open(path, "rb") as f:
+        data = f.read()
+    sample_rate = None
+    first = data.find(b"OggS")
+    if first >= 0 and first + 28 <= len(data):
+        seg_count = data[first + 26]
+        pkt_start = first + 27 + seg_count
+        if data[pkt_start:pkt_start + 7] == b"\x01vorbis":
+            sample_rate = int.from_bytes(data[pkt_start + 11:pkt_start + 15], "little")
+    last = data.rfind(b"OggS")
+    granule = -1
+    if last >= 0 and last + 14 <= len(data):
+        granule = int.from_bytes(data[last + 6:last + 14], "little")
+    if sample_rate and granule > 0:
+        return granule / sample_rate
+    return -1.0
+
+
+# (版本, 层) → 码率表（kbps），索引 = bitrate_index - 1
+_MP3_BITRATES = {
+    (1, 1): (32, 64, 96, 128, 160, 192, 224, 256, 288, 320, 352, 384, 416, 448),
+    (1, 2): (32, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384),
+    (1, 3): (32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320),
+    (2, 1): (32, 48, 56, 64, 80, 96, 112, 128, 144, 160, 176, 192, 224, 256),
+    (2, 2): (8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160),
+    (2, 3): (8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160),
+}
+# 版本 → 采样率表（索引 = sample_rate_index）
+_MP3_SAMPLE_RATES = {
+    3: (44100, 48000, 32000),   # MPEG1
+    2: (22050, 24000, 16000),   # MPEG2
+    0: (11025, 12000, 8000),    # MPEG2.5
+}
+
+
+def _parse_mp3_duration(path: str) -> float:
+    """
+    MP3：优先使用 Xing/Info 头（VBR 帧数精确计算），
+    否则按首帧码率与文件大小估算（CBR）。
+    """
+    with open(path, "rb") as f:
+        head = f.read(10)
+        # 跳过 ID3v2 标签头
+        if len(head) >= 10 and head[:3] == b"ID3":
+            size = ((head[6] & 0x7F) << 21) | ((head[7] & 0x7F) << 14) | (
+                head[8] & 0x7F) << 7 | (head[9] & 0x7F)
+            f.seek(10 + size)
+        else:
+            f.seek(0)
+        audio_start = f.tell()
+        frame = f.read(4)
+        if len(frame) < 4 or frame[0] != 0xFF or (frame[1] & 0xE0) != 0xE0:
+            return -1.0
+        ver = (frame[1] >> 3) & 0x03      # 3=MPEG1, 2=MPEG2, 0=MPEG2.5
+        layer = (frame[1] >> 1) & 0x03    # 1=Layer III, 2=Layer II, 3=Layer I
+        bri = (frame[2] >> 4) & 0x0F
+        sri = (frame[2] >> 2) & 0x03
+        if (ver not in _MP3_SAMPLE_RATES or layer == 0 or sri == 3
+                or bri == 0 or bri == 15):
+            return -1.0
+        bitrate_kbps = _MP3_BITRATES[(1 if ver == 3 else 2, layer)][bri - 1]
+        sample_rate = _MP3_SAMPLE_RATES[ver][sri]
+        ch_mode = (frame[3] >> 6) & 0x03  # 3=单声道
+        # 每帧采样数：Layer I=384，Layer II=1152，Layer III=1152(MPEG1)/576(MPEG2/2.5)
+        if layer == 3:
+            spf = 384
+        elif layer == 2:
+            spf = 1152
+        else:
+            spf = 1152 if ver == 3 else 576
+        # Xing/Info 头偏移：帧头后紧跟 side info
+        if ver == 3:
+            side = 17 if ch_mode == 3 else 32
+        else:
+            side = 9 if ch_mode == 3 else 17
+        f.seek(audio_start + 4 + side)
+        tag = f.read(4)
+        if tag in (b"Xing", b"Info"):
+            flags = int.from_bytes(f.read(4), "big")
+            if flags & 0x01:  # 含帧数
+                frames = int.from_bytes(f.read(4), "big")
+                if frames > 0:
+                    return frames * spf / sample_rate
+        # 无 Xing 头：按 CBR 估算
+        f.seek(0, 2)
+        audio_bytes = f.tell() - audio_start
+        return audio_bytes * 8 / (bitrate_kbps * 1000)
+
+
+def _parse_audio_duration(filepath: str) -> float:
+    """解析音频文件时长（秒）。解析失败返回 -1.0。"""
+    ext = Path(filepath).suffix.lower()
+    try:
+        if ext == ".wav":
+            return _parse_wav_duration(filepath)
+        if ext == ".flac":
+            return _parse_flac_duration(filepath)
+        if ext == ".ogg":
+            return _parse_ogg_duration(filepath)
+        if ext == ".mp3":
+            return _parse_mp3_duration(filepath)
+    except Exception:
+        pass
+    return -1.0
 
 
 class MusicPlayerError(Exception):
@@ -86,6 +233,9 @@ class MusicPlayer:
         self._paused: bool = False
         self._volume: float = 0.8                      # 0.0 ~ 1.0
         self._last_volume_before_fade: float = 0.8
+        # seek 起始偏移（秒）：pygame.mixer.music.get_pos() 只返回自最近一次
+        # play(start=...) 以来的毫秒数，进度条需要加上该偏移才是绝对播放位置
+        self._seek_offset: float = 0.0
 
         # 淡入淡出线程控制
         self._fade_lock = threading.Lock()
@@ -111,7 +261,8 @@ class MusicPlayer:
             if pygame.mixer.get_init():
                 pygame.mixer.quit()
             pygame.mixer.init(frequency=44100, size=-16, channels=2, buffer=512)
-            pygame.mixer.music.set_volume(self._volume)
+            with _MIXER_LOCK:
+                pygame.mixer.music.set_volume(self._volume)
         except pygame.error as exc:
             raise NoBackendsAvailableError(
                 f"pygame.mixer 初始化失败: {exc}"
@@ -259,7 +410,8 @@ class MusicPlayer:
         else:
             # 未指定索引：如果处于暂停则恢复，否则从头播放当前索引
             if self._paused:
-                pygame.mixer.music.unpause()
+                with _MIXER_LOCK:
+                    pygame.mixer.music.unpause()
                 self._paused = False
                 self._playing = True
             elif self._current_index >= 0:
@@ -271,14 +423,16 @@ class MusicPlayer:
     def pause(self) -> None:
         """暂停当前播放。若已暂停则无副作用。"""
         if self._playing and not self._paused:
-            pygame.mixer.music.pause()
+            with _MIXER_LOCK:
+                pygame.mixer.music.pause()
             self._paused = True
             self._playing = False
 
     def stop(self) -> None:
         """停止播放并重置状态。"""
         self._stop_fade()
-        pygame.mixer.music.stop()
+        with _MIXER_LOCK:
+            pygame.mixer.music.stop()
         self._playing = False
         self._paused = False
 
@@ -334,15 +488,17 @@ class MusicPlayer:
         # 确保停止任何正在进行的淡入淡出
         self._stop_fade()
 
-        try:
-            pygame.mixer.music.load(filepath)
-        except pygame.error as exc:
-            # 若加载失败，尝试跳到下一首（避免卡死）
-            # 但此处选择抛出异常，让上层处理
-            raise MusicPlayerError(f"无法加载音频文件: {filepath} — {exc}") from exc
+        with _MIXER_LOCK:
+            try:
+                pygame.mixer.music.load(filepath)
+            except pygame.error as exc:
+                # 若加载失败，尝试跳到下一首（避免卡死）
+                # 但此处选择抛出异常，让上层处理
+                raise MusicPlayerError(f"无法加载音频文件: {filepath} — {exc}") from exc
 
-        pygame.mixer.music.set_volume(self._volume)
-        pygame.mixer.music.play()
+            pygame.mixer.music.set_volume(self._volume)
+            pygame.mixer.music.play()
+        self._seek_offset = 0.0     # 新曲目从头播放
         self._playing = True
         self._paused = False
 
@@ -358,7 +514,8 @@ class MusicPlayer:
         volume = float(max(0.0, min(1.0, volume)))
         self._volume = volume
         self._last_volume_before_fade = volume
-        pygame.mixer.music.set_volume(volume)
+        with _MIXER_LOCK:
+            pygame.mixer.music.set_volume(volume)
 
     # ------------------------------------------------------------------
     #  淡入淡出 (Crossfade)
@@ -405,12 +562,14 @@ class MusicPlayer:
         target_volume = self._last_volume_before_fade
 
         # ---- 淡出 ----
-        current_vol = pygame.mixer.music.get_volume()
+        with _MIXER_LOCK:
+            current_vol = pygame.mixer.music.get_volume()
         for i in range(1, steps_out + 1):
             if self._fade_stop_event.is_set():
                 return
             new_vol = current_vol * (1 - i / steps_out)
-            pygame.mixer.music.set_volume(max(0.0, new_vol))
+            with _MIXER_LOCK:
+                pygame.mixer.music.set_volume(max(0.0, new_vol))
             time.sleep(CROSSFADE_STEP_MS / 1000.0)
 
         # ---- 切换曲目 ----
@@ -418,14 +577,16 @@ class MusicPlayer:
             return
         self._current_index = track_index
         try:
-            pygame.mixer.music.load(self._tracks[self._current_index])
-            pygame.mixer.music.set_volume(0.0)
-            pygame.mixer.music.play()
+            with _MIXER_LOCK:
+                pygame.mixer.music.load(self._tracks[self._current_index])
+                pygame.mixer.music.set_volume(0.0)
+                pygame.mixer.music.play()
             self._playing = True
             self._paused = False
         except pygame.error:
             # 播放失败，恢复音量并退出
-            pygame.mixer.music.set_volume(target_volume)
+            with _MIXER_LOCK:
+                pygame.mixer.music.set_volume(target_volume)
             return
 
         # ---- 淡入 ----
@@ -433,11 +594,13 @@ class MusicPlayer:
             if self._fade_stop_event.is_set():
                 return
             new_vol = target_volume * (i / steps_in)
-            pygame.mixer.music.set_volume(min(target_volume, new_vol))
+            with _MIXER_LOCK:
+                pygame.mixer.music.set_volume(min(target_volume, new_vol))
             time.sleep(CROSSFADE_STEP_MS / 1000.0)
 
         # 确保最终音量精确
-        pygame.mixer.music.set_volume(target_volume)
+        with _MIXER_LOCK:
+            pygame.mixer.music.set_volume(target_volume)
 
     def _stop_fade(self) -> None:
         """
@@ -450,7 +613,8 @@ class MusicPlayer:
                 self._fade_stop_event.clear()
             self._fade_thread = None
             # 恢复音量
-            pygame.mixer.music.set_volume(self._last_volume_before_fade)
+            with _MIXER_LOCK:
+                pygame.mixer.music.set_volume(self._last_volume_before_fade)
 
     # ------------------------------------------------------------------
     #  情绪播放列表切换
@@ -491,7 +655,8 @@ class MusicPlayer:
     @property
     def is_playing(self) -> bool:
         """当前是否正在播放（暂停不算正在播放）。"""
-        return self._playing and not self._paused and pygame.mixer.music.get_busy()
+        with _MIXER_LOCK:
+            return self._playing and not self._paused and pygame.mixer.music.get_busy()
 
     @property
     def current_track(self) -> dict:
@@ -524,6 +689,81 @@ class MusicPlayer:
         return info
 
     # ------------------------------------------------------------------
+    #  播放位置与时长接口（供 UI 进度条使用）
+    # ------------------------------------------------------------------
+    def get_playback_position(self) -> float:
+        """
+        获取当前播放位置（秒，相对曲目开头）。
+        若未在播放，返回 0.0。
+        """
+        if not pygame.mixer.get_init():
+            return 0.0
+        with _MIXER_LOCK:
+            # pygame.mixer.music.get_pos() 返回自最近一次 play() 以来的毫秒数，
+            # -1 表示未播放；加上 seek 偏移即曲目内的绝对位置
+            pos_ms = pygame.mixer.music.get_pos()
+            if pos_ms < 0:
+                return 0.0
+            return self._seek_offset + pos_ms / 1000.0
+
+    def get_track_duration(self) -> float:
+        """
+        获取当前曲目总时长（秒）。
+        通过解析音频文件头计算（WAV/FLAC/OGG/MP3），解析失败返回 -1.0。
+        """
+        track = self.current_track
+        duration = track.get("duration", -1)
+        if duration is not None and duration > 0:
+            return float(duration)
+        # 元数据缓存未含真实时长（如未加载曲目信息）：即时解析并回填缓存
+        if not self._tracks or self._current_index < 0:
+            return -1.0
+        filepath = self._tracks[self._current_index]
+        parsed = _parse_audio_duration(filepath)
+        self._track_metadata_cache.setdefault(filepath, {})["duration"] = parsed
+        return parsed
+
+    def seek_to(self, position_sec: float) -> None:
+        """
+        跳转到指定播放位置（秒）。
+
+        pygame.mixer.music 不支持直接定位，通过重新加载曲目并指定
+        start=position_sec 从目标位置开始播放实现。
+        """
+        if not pygame.mixer.get_init():
+            return
+        if not self._tracks or self._current_index < 0:
+            return
+        position_sec = max(0.0, float(position_sec))
+        filepath = self._tracks[self._current_index]
+        was_paused = self._paused
+        # 打断正在进行的淡入淡出，避免与 seek 冲突
+        self._stop_fade()
+        seeked = False
+        with _MIXER_LOCK:
+            try:
+                pygame.mixer.music.stop()
+                pygame.mixer.music.load(filepath)
+                pygame.mixer.music.set_volume(self._volume)
+                pygame.mixer.music.play(start=position_sec)
+                seeked = True
+                if was_paused:
+                    pygame.mixer.music.pause()
+            except pygame.error:
+                # 部分格式/后端不支持 start 参数：退化为从头播放
+                try:
+                    pygame.mixer.music.play()
+                    if was_paused:
+                        pygame.mixer.music.pause()
+                except pygame.error:
+                    pass
+        # 记录 seek 偏移：play(start=X) 后 get_pos() 从 0 重新计数，
+        # 进度条需加上该偏移才能显示曲目内的绝对位置
+        self._seek_offset = position_sec if seeked else 0.0
+        self._playing = not was_paused
+        self._paused = was_paused
+
+    # ------------------------------------------------------------------
     #  其他工具方法
     # ------------------------------------------------------------------
     def get_playlist_info(self) -> dict:
@@ -546,17 +786,19 @@ class MusicPlayer:
         """
         self.stop()
         # pygame.mixer.music.unload() 在 pygame >= 2.1.0 才可用，旧版本回退到 stop
-        if hasattr(pygame.mixer.music, 'unload'):
-            pygame.mixer.music.unload()
-        pygame.mixer.quit()
+        with _MIXER_LOCK:
+            if hasattr(pygame.mixer.music, 'unload'):
+                pygame.mixer.music.unload()
+            pygame.mixer.quit()
 
     def __del__(self):
         """
         析构时尝试安全释放资源。
         """
         try:
-            if pygame.mixer.get_init():
-                pygame.mixer.quit()
+            with _MIXER_LOCK:
+                if pygame.mixer.get_init():
+                    pygame.mixer.quit()
         except Exception:
             pass
 

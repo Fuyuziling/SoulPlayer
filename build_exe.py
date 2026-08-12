@@ -9,7 +9,7 @@ SoulPlayer .exe 打包脚本
 说明：
 - 使用 PyInstaller --onedir 模式（单文件夹）
 - 自动包含所有资源文件（模型、预设、语音模型、音乐）
-- 处理 MediaPipe / pygame / Vosk 等依赖的隐藏导入
+- 处理 MediaPipe / pygame / sounddevice 等依赖的隐藏导入
 - 输出到 SoulPlayer/dist/SoulPlayer/
 """
 
@@ -31,11 +31,10 @@ OUTPUT_NAME = "SoulPlayer"
 # 格式：(源路径, 目标目录)
 RESOURCES = [
     (PROJECT_DIR / "pose_landmarker_full.task", "."),
+    (PROJECT_DIR / "hand_landmarker.task", "."),
     (PROJECT_DIR / "presets" / "default_presets.json", "presets"),
-    (PROJECT_DIR / "voice_triggers.json", "."),
     (PROJECT_DIR / "voice_templates.json", "."),
     (PROJECT_DIR / "voice_templates", "voice_templates"),
-    (PROJECT_DIR / "vosk-model", "vosk-model"),
     (PROJECT_DIR / "custom_presets", "custom_presets"),
     (PROJECT_DIR / "music", "music"),
 ]
@@ -47,7 +46,7 @@ HIDDEN_IMPORTS = [
     "gesture_presets",
     "music_player",
     "custom_preset",
-    "voice_trigger",
+    "voice_match",
     "ui_theme",
     "ui_animations",
     # OpenCV / NumPy
@@ -65,8 +64,7 @@ HIDDEN_IMPORTS = [
     "mediapipe.tasks.python.vision",
     "mediapipe.python._framework_bindings",
     "google.protobuf",
-    # Vosk / 语音
-    "vosk",
+    # 语音（模板比对，依赖 sounddevice）
     "sounddevice",
     # tkinter（文件对话框）
     "tkinter",
@@ -130,7 +128,6 @@ def build_command():
     # 尝试自动收集 mediapipe 的所有子模块和数据
     cmd.extend(["--collect-all", "mediapipe"])
     cmd.extend(["--collect-all", "pygame"])
-    cmd.extend(["--collect-all", "vosk"])
     cmd.extend(["--collect-all", "sounddevice"])
 
     # 入口脚本

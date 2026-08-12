@@ -94,7 +94,7 @@ python run.py
 ## ❓ 常见问题
 
 **Q: 语音触发不灵 / 容易误触？**
-控制台会打印每次比对的距离（`比对: voice_xxxxxx=0.xx（阈值 0.45）`）。该触发没触发就把距离调大 `voice_match.py` 中的 `MATCH_THRESHOLD`，误触就调小。录音建议在安静环境、距麦克风 30cm 左右。
+控制台会打印每次比对的距离（`比对: voice_xxxxxx=0.xx（阈值 0.60）`）。该触发没触发就把距离调大 `voice_match.py` 中的 `MATCH_THRESHOLD`，误触就调小。录音建议在安静环境、距麦克风 30cm 左右。
 
 **Q: 挥手不触发？**
 动作幅度大一些（横向跨度需超过 15% 屏宽）、速度自然即可，确保手腕在画面中可见。
@@ -112,6 +112,8 @@ python tests/test_data_voice.py   # 数据目录 / 语音匹配 / 音量分离
 python build_exe.py
 ```
 产物在 `dist/SoulPlayer/`。音乐与自定义数据（预设、语音模板）优先读写项目源码目录，其次是 exe 旁边；exe 内部的旧数据会在首次启动时自动迁移出来。
+
+> 💡 本仓库 `release/SoulPlayer/` 已附带预编译好的 Windows 可执行版（onedir 模式，含 `SoulPlayer.exe` 与 `_internal/`），下载后运行 `SoulPlayer.exe` 或 `run.bat` 即可，无需安装 Python。
 
 ---
 

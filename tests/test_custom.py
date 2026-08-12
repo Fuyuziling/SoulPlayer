@@ -108,5 +108,30 @@ for i in range(5):
         fired2.append(a)
 check("E2 自定义不匹配时挥手正常触发", "player_next" in fired2, str(fired2))
 
+# ---------- C5: 双向挥手共用冷却（回正动作被吞） ----------
+import types
+import main as m
+
+calls = []
+class _P:
+    def pause(self): calls.append("pause")
+    def play(self): calls.append("play")
+    def next_track(self): calls.append("next")
+    def previous_track(self): calls.append("prev")
+
+_app = types.SimpleNamespace(player=_P(), _action_cooldowns={},
+                             _add_log=lambda s: None,
+                             custom_manager=None, voice_trigger=None)
+_h = lambda a: m.SoulPlayerApp._handle_action(_app, a)
+
+_h("player_next")   # 切歌触发
+_h("player_prev")   # 回正动作紧随而来 → 应被共用冷却吞掉
+check("C5 回正不误触上一首", calls == ["next"], str(calls))
+_app._action_cooldowns["player_wave"] -= 1.1  # 模拟 1.1 秒过去
+_h("player_prev")   # 冷却结束后正常触发
+check("C5 冷却结束上一首恢复", calls == ["next", "prev"], str(calls))
+_h("player_next")   # 立刻反向再挥 → 仍被共用冷却拦截
+check("C5 冷却内双向都拦截", calls == ["next", "prev"], str(calls))
+
 print(f"\n===== {len(PASS)} 通过, {len(FAIL)} 失败 =====")
 sys.exit(1 if FAIL else 0)
