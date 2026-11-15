@@ -423,18 +423,14 @@ def draw_pose_skeleton(surface: pygame.Surface, landmarks: List[dict],
         return
 
     ox, oy = offset
-    # 映射到屏幕坐标（骨架 x 镜像 + 下移 + 水平跟随：画面保持原始视角）
-    s11, s12 = landmarks[11], landmarks[12]
-    # 垂直：肩膀基准线平移到画面底端
-    dy = 1.0 - (s11.get("y", 0) + s12.get("y", 0)) / 2.0
-    # 水平：以肩膀中心为锚，镜像后骨架整体跟随用户左右移动
-    # px = (2*cx - x) * frame_w：中心跟随用户位置，姿态绕中心镜像（照镜子）
-    cx = (s11.get("x", 0) + s12.get("x", 0)) / 2.0
-    dx = (2.0 * cx - 1.0) * frame_w
+    # 映射到屏幕坐标：直接按归一化坐标做 x 镜像（与摄像头画面/手部骨架
+    # 同方向），骨架显示在真人的实际位置，随身体移动而移动。
+    # 注意：不再做"肩膀线平移到画面底端"的 dx/dy 重定位——那会把整个
+    # 骨架（含脸 0-10 / 肩 11-12）定死在预览框底部，不跟随真人。
     points = []
     for lm in landmarks:
-        px = int(ox + (1.0 - lm.get("x", 0)) * frame_w + dx)
-        py = int(oy + (lm.get("y", 0) + dy) * frame_h)
+        px = int(ox + (1.0 - lm.get("x", 0)) * frame_w)
+        py = int(oy + lm.get("y", 0) * frame_h)
         vis = lm.get("visibility", 0)
         points.append((px, py, vis))
 
@@ -555,7 +551,8 @@ def draw_motion_trail(surface: pygame.Surface, landmarks_history: List[List[dict
         left_hip = lms[23]
         right_hip = lms[24]
         if left_hip.get("visibility", 0) > 0.5 and right_hip.get("visibility", 0) > 0.5:
-            cx = int((left_hip["x"] + right_hip["x"]) / 2 * frame_w)
+            # 统一做 x 镜像（与 draw_pose_skeleton / draw_hand_skeleton 一致）
+            cx = int((1.0 - (left_hip["x"] + right_hip["x"]) / 2) * frame_w)
             cy = int((left_hip["y"] + right_hip["y"]) / 2 * frame_h)
             centers.append((cx, cy))
 

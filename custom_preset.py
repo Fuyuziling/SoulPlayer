@@ -100,6 +100,7 @@ class PresetRecorder:
         self.samples: List[Dict[str, float]] = []          # 动作期样本
         self.baseline_samples: List[Dict[str, float]] = []  # 中性基线样本（倒计时/准备期）
         self.trajectories: List[list] = []   # 录制期收集的肘部轨迹快照（DTW 模板用）
+        self.hand_visibility_samples: List[float] = []  # 手部关键点平均可见度（录制期）
         self.state = self.STATE_IDLE
         self.countdown_start: Optional[float] = None
         self.recording_start: Optional[float] = None
@@ -109,6 +110,7 @@ class PresetRecorder:
         self.samples = []
         self.baseline_samples = []
         self.trajectories = []
+        self.hand_visibility_samples = []  # 重置手部可见度统计
         self.state = self.STATE_COUNTDOWN
         self.countdown_start = time.time()
         self.recording_start = None
@@ -158,6 +160,21 @@ class PresetRecorder:
             if traj and len(traj) >= 2:
                 self.trajectories.append(
                     [(float(p[0]), float(p[1])) for p in traj])
+            # 统计手部关键点可见度（用于录制质量评估）
+            # 手部关键点：腕部(15/16)、食指根(17/18)、小指根(19/20)、拇指(21/22)
+            hand_vis_keys = [
+                'pose_hand_dx_L', 'pose_hand_dy_L',
+                'pose_hand_dx_R', 'pose_hand_dy_R',
+                'pose_spread_L', 'pose_spread_R'
+            ]
+            hand_vis_values = [
+                motion_features.get(k)
+                for k in hand_vis_keys
+                if k in motion_features and isinstance(motion_features[k], (int, float))
+            ]
+            # 可见度：有手部特征帧数 / 总帧数（归一化到 0~1）
+            if hand_vis_values:
+                self.hand_visibility_samples.append(1.0)
 
     def _extract_sample(self, motion_features: dict) -> dict:
         """从一帧特征中提取录制用样本（数值特征 + 离散枚举 + 构型特征）。"""
@@ -332,8 +349,13 @@ class PresetRecorder:
                         pose[key] = round(_mean(avals), 4)
                         pose_std[key] = round(max(_std(avals), 0.05), 4)
 
-        # 动态度：轨迹跨度（归一化到 0.15）与运动能量方差（归一化到 0.1）
-        # 各占一半权重，clamp 到 [0,1]。
+        # 动态度：轨迹跨度（归一化到 0.15）与**手臂运动能量**方差
+        #（归一化到 0.1）各占一半权重，clamp 到 [0,1]。
+        # 用 arm_motion_energy 而非 motion_energy：后者是躯干+腿部能量
+        #（motion_capture 中显式排除手臂 0-16），拍手/比划等手臂动作时
+        # 躯干不动 → motion_energy≈0 → 方差≈0 → 动态度被低估为"静态"，
+        # 判定偏向 pose 构型（均值模板对运动过程不匹配）→ 动作无法触发。
+        # 参考数据：动作识别以"参与动作的部位"的能量为幅度因子。
         traj_span = 0.0
         if self.trajectories:
             traj_span = max(
@@ -341,7 +363,9 @@ class PresetRecorder:
                 + (max(p[1] for p in t) - min(p[1] for p in t))
                 for t in self.trajectories
             )
-        energy_vals = [s.get("motion_energy", 0.0) for s in self.samples]
+        energy_vals = [max(s.get("motion_energy", 0.0),
+                           s.get("arm_motion_energy", 0.0))
+                       for s in self.samples]
         energy_std = _std(energy_vals) if energy_vals else 0.0
         dynamism = max(0.0, min(1.0,
             (traj_span / 0.15 + energy_std / 0.1) / 2.0))
@@ -354,8 +378,11 @@ class PresetRecorder:
         # 防止静止时手停在录制姿态附近被 pose 构型判定误命中（"静止误触"根因）。
         conditions["active_segments"] = list(active_segs)
         conditions["dynamism"] = round(dynamism, 3)
-        # duration = 0.3 + 0.7×(1-D)：静态 1.0s / 动态 0.3s 线性过渡
-        conditions["duration"] = round(0.3 + 0.7 * (1.0 - dynamism), 2)
+        # duration = 0.15 + 0.85×(1-D)：静态 1.0s / 动态 0.15s 线性过渡。
+        # 动态下限 0.15s：拍手/比划等瞬时动作约 0.1~0.3s（参考：手势识别
+        # 最短 3 帧≈0.1s、正常识别延迟 0.21±0.05s），旧下限 0.3s 需动作
+        # 连续 9 帧命中，瞬时动作任一帧抖动即清零 → 录制动作无法触发。
+        conditions["duration"] = round(0.15 + 0.85 * (1.0 - dynamism), 2)
 
         # DTW 轨迹模板：取录制期间肘部跨度最大的快照（代表动作主体形态），
         # 下采样到 20 点并归一化，供触发端 _match_template 用 DTW 匹配。
@@ -383,6 +410,25 @@ class PresetRecorder:
                 value, count = Counter(values).most_common(1)[0]
                 if count / len(values) >= 0.6:
                     conditions[key] = [value]
+
+        # ── 手部可见度检查（录制质量评估）──
+        # 如果手部关键点在录制期可见度过低，会导致 pose_spread 缺失 →
+        # 手型约束失效 → 容易与相似动作串播。
+        # 这里统计可见度并给出警告，让用户知道录制质量不佳。
+        if self.hand_visibility_samples:
+            hand_vis_ratio = len(self.hand_visibility_samples) / max(len(self.samples), 1)
+            if hand_vis_ratio < 0.5 and "手部" in active_segs:
+                import sys
+                print(
+                    f"[WARN] 录制警告：手部关键点可见度仅 {hand_vis_ratio:.1%} "
+                    f"({len(self.hand_visibility_samples)}/{len(self.samples)} 帧)，"
+                    f"pose_spread 可能缺失 → 手型约束失效 → 易与相似动作串播",
+                    file=sys.stderr
+                )
+                print(
+                    f"[WARN] 建议：重新录制，确保手掌/手指清晰可见（正对镜头，光线充足）",
+                    file=sys.stderr
+                )
         return conditions
 
     def get_recording_summary(self) -> str:
@@ -462,7 +508,7 @@ class CustomPresetManager:
                         self.presets.append(preset)
                         self._save_single_preset(preset)
                         migrated += 1
-                except Exception as e:
+                except (OSError, json.JSONDecodeError, ValueError) as e:
                     print(f"[CustomPresetManager] 迁移预设失败: {e}")
 
             if migrated > 0:
@@ -473,7 +519,7 @@ class CustomPresetManager:
             legacy.rename(backup)
             print(f"[CustomPresetManager] 旧版文件已备份为 {backup.name}")
 
-        except Exception as e:
+        except (OSError, json.JSONDecodeError, ValueError) as e:
             print(f"[CustomPresetManager] 迁移旧版数据失败: {e}")
 
     @staticmethod
@@ -617,8 +663,14 @@ class CustomPresetManager:
 
             except json.JSONDecodeError as e:
                 print(f"[CustomPresetManager] JSON 解析失败（已跳过）: {json_file.name} — {e}")
-            except Exception as e:
+            except (OSError, ValueError, TypeError) as e:
                 print(f"[CustomPresetManager] 加载失败（已跳过）: {json_file.name} — {e}")
+            except Exception as e:  # noqa: BLE001
+                # 【P0-⑥】兜底：单个预设文件损坏不应导致整个应用启动崩溃。
+                # GesturePreset.from_dict 会对缺失字段主动 raise KeyError，
+                # 手写/编辑过的预设、跨版本遗留文件都可能命中——这里一律跳过并告警。
+                print(f"[CustomPresetManager] 预设文件异常（已跳过）: "
+                      f"{json_file.name} — {type(e).__name__}: {e}")
 
         # 按持久化的 order 恢复手动排序
         self.presets.sort(key=lambda p: getattr(p, 'order', 9999))
@@ -629,7 +681,7 @@ class CustomPresetManager:
                 try:
                     self._save_single_preset(p)
                     print(f"[CustomPresetManager] 已清洗预设条件: {p.name}")
-                except Exception as e:
+                except (OSError, TypeError, ValueError) as e:
                     print(f"[CustomPresetManager] 清洗后保存失败: {p.name} — {e}")
         # 统一提升优先级（迁移旧版 priority=5 的预设）：
         # 自定义动作不存在先后关系，匹配到就触发，不被内置动作抢占

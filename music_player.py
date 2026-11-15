@@ -19,6 +19,7 @@ import random
 from pathlib import Path
 from typing import List, Optional
 
+import pygame
 import pygame.mixer
 
 # pygame.mixer.music 非线程安全：主线程的控制调用与淡入淡出 worker 线程
@@ -30,6 +31,13 @@ _MIXER_LOCK = threading.RLock()
 #  常量
 # ---------------------------------------------------------------------------
 SUPPORTED_AUDIO_EXTS = {".mp3", ".wav", ".ogg", ".flac"}
+
+# 【P0-①】曲目播放结束事件：pygame.mixer.music.set_endevent 注册后，
+# 一首歌"停止"时 SDL_mixer 会往 pygame 事件队列投递该事件，主循环据此自动切下一首。
+MUSIC_END_EVENT = pygame.USEREVENT + 1
+# 自动切歌总开关：置 0 即回到"播完即停"的原行为（出问题时的一键兜底）。
+# 在源头（本模块的事件判定）拦截，调用方 main._on_track_ended 处还有一道。
+AUTO_ADVANCE_ENV = "SOULPLAYER_AUTO_ADVANCE"
 DEFAULT_CROSSFADE_MS = 2000          # 默认淡入淡出时长（毫秒）
 CROSSFADE_STEP_MS = 50               # 每次音量调整的间隔（毫秒）
 
@@ -245,6 +253,11 @@ class MusicPlayer:
         # 跨曲目信息缓存（用于 current_track 属性）
         self._track_metadata_cache: dict[str, dict] = {}
 
+        # 【P0-①】自动切歌：区分"自然播完"与"被停止"的辅助标记。
+        # SDL_mixer 的结束回调在自然播完、stop()、以及切歌时旧曲被 halt 三种
+        # 情况下都会投递事件，需靠它 + get_busy() 过滤伪事件（见 is_music_end_event）。
+        self._user_stopped: bool = False
+
         # 初始化 pygame.mixer
         self._init_backend()
 
@@ -263,6 +276,12 @@ class MusicPlayer:
             pygame.mixer.init(frequency=44100, size=-16, channels=2, buffer=512)
             with _MIXER_LOCK:
                 pygame.mixer.music.set_volume(self._volume)
+                # 【P0-①】注册播放结束事件，供主循环自动切下一首。
+                # 个别后端可能不支持，失败只影响自动切歌，不影响正常播放。
+                try:
+                    pygame.mixer.music.set_endevent(MUSIC_END_EVENT)
+                except Exception:  # noqa: BLE001
+                    pass
         except pygame.error as exc:
             raise NoBackendsAvailableError(
                 f"pygame.mixer 初始化失败: {exc}"
@@ -431,10 +450,44 @@ class MusicPlayer:
     def stop(self) -> None:
         """停止播放并重置状态。"""
         self._stop_fade()
+        # 【P0-①】标记为"用户主动停止"：SDL_mixer 也会因此投递结束事件，
+        # 主循环须忽略它，否则一点停止就跳下一首。
+        self._user_stopped = True
         with _MIXER_LOCK:
             pygame.mixer.music.stop()
         self._playing = False
         self._paused = False
+
+    def is_music_end_event(self, event) -> bool:
+        """
+        【P0-①】判断该 pygame 事件是否为"当前曲目自然播放结束"。
+
+        SDL_mixer 的结束回调在以下三种情况都会投递 MUSIC_END_EVENT，只有第一种
+        才应该触发自动切歌，其余必须过滤，否则会出现"手动停止就跳歌""切歌连环跳"：
+          1) 自然播完              → True（应切下一首）
+          2) 用户 stop()           → False（_user_stopped 标记消费掉）
+          3) 切歌/重载时旧曲被 halt → False（此刻新曲已在播，get_busy() 为真）
+
+        :param event: pygame.event.Event
+        :return: 是否应自动切下一首
+        """
+        if event is None or event.type != MUSIC_END_EVENT:
+            return False
+        # 总开关：置 0 时一律不自动切歌
+        if os.environ.get(AUTO_ADVANCE_ENV, "").strip() == "0":
+            return False
+        # 情况 2：用户主动停止引起的伪事件，消费标记后忽略
+        if self._user_stopped:
+            self._user_stopped = False
+            return False
+        # 情况 3：旧曲被 halt、新曲已在播放
+        try:
+            if pygame.mixer.music.get_busy():
+                return False
+        except Exception:  # noqa: BLE001
+            return False
+        # 情况 1：确实播完了（暂停状态下不应切歌）
+        return bool(self._playing) and not self._paused
 
     def next_track(self) -> None:
         """
@@ -501,6 +554,9 @@ class MusicPlayer:
         self._seek_offset = 0.0     # 新曲目从头播放
         self._playing = True
         self._paused = False
+        # 【P0-①】新曲目开始：清除"用户主动停止"标记（该标记只用于过滤
+        # 停止动作紧接着投递的那一次伪结束事件）。
+        self._user_stopped = False
 
     # ------------------------------------------------------------------
     #  音量控制

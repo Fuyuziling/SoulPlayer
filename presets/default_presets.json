@@ -8,17 +8,17 @@
                     "min": 0.5,
                     "max": 1.0
                 },
-                "duration": 0.5
+                "duration": 0.35
             },
             "action": "player_pause",
             "priority": 10
         },
         {
-            "name": "挥手切歌",
-            "description": "手臂横向挥动（显像框中从右向左）切下一首",
+            "name": "挥手下一首",
+            "description": "手臂横向挥动（向左挥手）切到下一首",
             "conditions": {
                 "arm_horizontal_motion": {
-                    "min": 0.2,
+                    "min": 0.19,
                     "max": 1.0
                 },
                 "wave_direction": {
@@ -32,10 +32,10 @@
         },
         {
             "name": "挥手上一首",
-            "description": "手臂横向挥动（显像框中从左向右）切上一首",
+            "description": "手臂横向挥动（向右挥手）切上一首",
             "conditions": {
                 "arm_horizontal_motion": {
-                    "min": 0.2,
+                    "min": 0.19,
                     "max": 1.0
                 },
                 "wave_direction": {

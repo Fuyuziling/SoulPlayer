@@ -24,22 +24,25 @@ import traceback
 import inspect
 from pathlib import Path
 from typing import Optional, Dict, Any
+from dataclasses import dataclass
 
-# ==================== 未捕获异常自动写入日志 ====================
-# 这样即使窗口闪退，也能在 error.log 中查看错误信息
-def _log_uncaught_exception(exc_type, exc_value, exc_traceback):
-    try:
-        log_path = Path(__file__).parent / "error.log"
-        with open(log_path, "a", encoding="utf-8") as f:
-            f.write(f"\n{'='*50}\n")
-            f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 未捕获异常:\n")
-            traceback.print_exception(exc_type, exc_value, exc_traceback, file=f)
-            f.write(f"{'='*50}\n")
-    except Exception:
-        pass
-    sys.__excepthook__(exc_type, exc_value, exc_traceback)
+# ==================== 应用路径与日志 ====================
+# 必须在任何 print 之前初始化，原因有两条：
+#   1. 正式版用 --windowed 打包，此时 sys.stdout / sys.stderr 是 None，
+#      项目里 190+ 处 print 会直接抛 AttributeError；
+#   2. 未捕获异常、子线程崩溃、原生库硬崩溃都要留下证据，
+#      否则用户只能反馈"打不开"，无从排查。
+try:
+    import app_paths
+except Exception as _e:  # noqa: BLE001
+    app_paths = None
+    print(f"[警告] 路径层不可用（应用继续启动）: {_e}")
 
-sys.excepthook = _log_uncaught_exception
+try:
+    import app_logging
+    app_logging.setup()
+except Exception as _e:  # noqa: BLE001
+    print(f"[警告] 日志初始化失败（应用继续启动）: {_e}")
 
 # ==================== 第三方依赖 ====================
 try:
@@ -48,13 +51,26 @@ try:
 except ImportError as e:
     print(f"[致命错误] 缺少依赖: {e}")
     print("请运行: pip install -r requirements.txt")
-    input("按回车键退出...")
+    # 正式版以 --windowed 打包后没有控制台，input() 会直接抛异常
+    try:
+        if sys.stdin is not None and sys.stdin.isatty():
+            input("按回车键退出...")
+    except (OSError, RuntimeError, AttributeError):
+        pass
     sys.exit(1)
 
 try:
     import cv2
 except ImportError:
     cv2 = None
+
+# 手机联动接收端（预留板块的数据层，协议与状态机见 sensor_link.py）。
+# 本轮只接数据层与面板展示；网络传输层就位后，主循环里 poll() 出来的
+# 事件直接走 _handle_action，与视觉动作共用同一张冷却表。
+try:
+    from sensor_link import SensorLinkHub
+except ImportError:  # 桩：文件缺失时不阻塞主程序
+    SensorLinkHub = None
 
 # ==================== 项目模块导入（带降级桩） ====================
 # 若项目子模块尚未实现，则使用内置的最小桩实现，确保主程序可独立运行。
@@ -343,7 +359,7 @@ except ImportError:
                     pygame.mixer.music.load(self._playlist[self._current_index])
                     pygame.mixer.music.play()
                     pygame.mixer.music.set_volume(self._volume)
-                except Exception as e:
+                except (pygame.error, FileNotFoundError, OSError) as e:
                     print(f"[MusicPlayer] 播放失败: {e}")
 
         def play_track(self, filepath: str):
@@ -353,7 +369,7 @@ except ImportError:
                 pygame.mixer.music.play()
                 pygame.mixer.music.set_volume(self._volume)
                 self._current_index = -1
-            except Exception as e:
+            except (pygame.error, FileNotFoundError, OSError) as e:
                 print(f"[MusicPlayer] 播放失败: {e}")
 
         def pause(self):
@@ -443,6 +459,10 @@ class _MusicPlayerStub:
 
     def stop(self):
         pass
+
+    def is_music_end_event(self, event):
+        """【P0-①】降级桩：无真实播放器时不做自动切歌。"""
+        return False
 
     def next_track(self):
         pass
@@ -544,6 +564,53 @@ except ImportError:
 
 # ==================== 主程序 ====================
 
+# ---------------------------------------------------------------------------
+#  动作冷却表（声明式）
+# ---------------------------------------------------------------------------
+# 所有动作都经过 _handle_action 这一个出口（手势判定与语音指令共用），
+# 所以冷却只需在这一层声明一次，两个通道同时生效。
+#
+# 为什么主战场在这里，而不是判定层 PresetEngine：
+#   判定层按「预设名」锁存，两个自定义预设名字不同、彼此看不见，
+#   跨预设的重复只有本表（按「动作名」）能拦下。实测自定义动作保持 3s
+#   时判定层仍 raw 触发 2 次（两个不同预设），靠本表压到实际执行 1 次。
+#
+# 新增动作时在此加一行，不要再回 _handle_action 里补 if 分支。
+
+
+@dataclass(frozen=True)
+class CooldownRule:
+    """单个动作的冷却策略。"""
+    self_cd: float                          # 同一动作重复触发的冷却（秒）
+    peer_cd: float = 0.0                    # 配对动作的冷却（见 peers）
+    peers: frozenset = frozenset()          # 配对动作集合，双向互相约束
+    also_block: frozenset = frozenset()     # 本动作触发时连带打时间戳的动作
+
+
+ACTION_COOLDOWN_RULES: Dict[str, CooldownRule] = {
+    # 挥手切歌：一次挥手行程本身约 0.3~0.7s，冷却必须短于行程，否则正常
+    # 速度的连续挥手会"跟不上"（旧值反向 0.9s 就偏长）。
+    # 0.35s 同向防连发；0.6s 反向防回程/方向闪断误判——回程串反向已由
+    # motion_capture 的方向锁存主要挡住，此处是第二道保险。
+    # also_block custom_play：挥手的收手/回正余波与自定义模板特征相近，
+    # 不屏蔽会被识别成自定义动作放错歌（与下方形成双向隔离）。
+    "player_next": CooldownRule(
+        self_cd=0.35, peer_cd=0.6, peers=frozenset({"player_prev"}),
+        also_block=frozenset({"custom_play"})),
+    "player_prev": CooldownRule(
+        self_cd=0.35, peer_cd=0.6, peers=frozenset({"player_next"}),
+        also_block=frozenset({"custom_play"})),
+    # 瞬时状态切换类：误触发的代价是"正听着突然停"，冷却给足 1s。
+    "player_pause": CooldownRule(self_cd=1.0),
+    "player_play": CooldownRule(self_cd=1.0),
+    # 自定义动作：条件在触发后仍会持续满足若干帧，不冷却会每帧重启歌曲。
+    # also_block 切歌：自定义动作的收手余波与挥手相似，不屏蔽会误切歌。
+    "custom_play": CooldownRule(
+        self_cd=1.0,
+        also_block=frozenset({"player_next", "player_prev"})),
+}
+
+
 class _VoiceTemplateRef:
     """语音模板适配对象：让模板可以复用预设删除确认弹窗。"""
     _is_voice_template = True
@@ -598,9 +665,17 @@ class SoulPlayerApp:
         print("[DEBUG] pygame 初始化完成")
         
         pygame.display.set_caption("SoulPlayer")
-        self.screen = pygame.display.set_mode((self.WIN_WIDTH, self.WIN_HEIGHT))
+        # RESIZABLE | SCALED：窗口像常规软件一样可拖拽/点击右上角最大化按钮
+        # 全屏；SCALED 让 SDL 把固定 1280x720 的逻辑画面自动缩放到窗口大小，
+        # UI 绘制代码零改动（坐标仍基于 1280x720），缩放由硬件完成、动效流畅，
+        # 鼠标事件坐标也会被自动映射回逻辑坐标，交互不受影响。
+        self.screen = pygame.display.set_mode(
+            (self.WIN_WIDTH, self.WIN_HEIGHT),
+            pygame.RESIZABLE | pygame.SCALED
+        )
         self.clock = pygame.time.Clock()
         self.running = True
+        self._exiting = False  # 退出状态标记（用于显示退出提示）
 
         # 关键修复：关闭 SDL 文本输入模式。
         # SDL 默认开启文本输入，中文输入法（IME）激活时会拦截 R/V 等字母键
@@ -608,6 +683,7 @@ class SoulPlayerApp:
         # 本项目不需要文本输入，关闭后字母键可直达程序。
         pygame.key.stop_text_input()
         print("[DEBUG] 已关闭文本输入模式（防止输入法拦截字母键）")
+        self._apply_window_icon()
         print("[DEBUG] 显示窗口创建完成")
 
         # 字体初始化
@@ -616,18 +692,34 @@ class SoulPlayerApp:
         self._init_fonts()
         print("[DEBUG] 字体初始化完成")
 
+        # 启动加载画面（避免重量级初始化期间黑屏）
+        self._draw_boot_screen("正在加载动作捕捉模块（首次启动较慢）...")
+
         # 初始化子模块
         print("[DEBUG] 开始初始化动作捕捉模块...")
         try:
             self.motion = MotionCapture(camera_id=0, model_complexity=1)
             print("[DEBUG] 动作捕捉模块创建完成")
+            self.motion._debug = True
             self.preset_engine = PresetEngine()
             print("[DEBUG] 预设引擎创建完成")
+
+            # ── 连接 motion_capture 和 preset_engine（P1+P2学习系统） ──
+            # 将 motion_capture 实例传入 preset_engine，支持动态阈值和触发记录
+            print(f"[DEBUG] 检查 preset_engine 方法: hasattr={hasattr(self.preset_engine, 'set_motion_capture')}")
+            if hasattr(self.preset_engine, 'set_motion_capture'):
+                self.preset_engine.set_motion_capture(self.motion)
+                # 设置 main 实例引用（用于 gesture_presets 访问 recent_actions）
+                self.motion._main_instance = self
+                print("[DEBUG] motion_capture 与 preset_engine 连接成功（P1+P2学习系统已启用）")
+            else:
+                print("[WARN] preset_engine 没有 set_motion_capture 方法！学习系统可能未启用")
+
             preset_path = Path(__file__).parent / "presets" / "default_presets.json"
             print(f"[DEBUG] 加载预设文件: {preset_path}")
             self.preset_engine.load_presets(str(preset_path))
             print("[DEBUG] 预设加载完成")
-        except Exception as e:
+        except (OSError, json.JSONDecodeError, ValueError) as e:
             print(f"[初始化错误] 模块加载失败: {e}")
             raise
 
@@ -637,8 +729,10 @@ class SoulPlayerApp:
         self.action_timestamp = 0.0
         self._action_cooldowns: Dict[str, float] = {}  # 动作冷却期记录
         self.log_messages: list[tuple[str, float]] = []
+        self.recent_actions: list[dict] = []  # 最近触发的动作（用于学习系统UI确认）
 
         # 初始化播放器
+        self._draw_boot_screen("正在加载音乐播放器...")
         print("[DEBUG] 开始初始化音乐播放器...")
         try:
             self.player = MusicPlayer()
@@ -658,13 +752,13 @@ class SoulPlayerApp:
                     else:
                         print("[DEBUG] 音乐文件夹为空，请放入 .mp3 文件")
                         self._add_log("音乐文件夹为空，请放入 .mp3 文件")
-                except Exception as e:
+                except (OSError, pygame.error) as e:
                     print(f"[DEBUG] 自动加载音乐失败: {e}")
                     self._add_log("音乐加载失败")
             else:
                 print(f"[DEBUG] 未找到音乐文件夹: {music_folder}")
                 self._add_log("未找到音乐文件夹，请创建 music/ 目录")
-        except Exception as e:
+        except (OSError, pygame.error, ImportError) as e:
             print(f"[警告] 音频播放器初始化失败: {e}")
             self.player = _MusicPlayerStub()
             print("[DEBUG] 音乐播放器降级完成")
@@ -677,10 +771,14 @@ class SoulPlayerApp:
                     storage_dir=str(self._data_dir("custom_presets")))
                 self.custom_manager.inject_into_engine(self.preset_engine)
                 print(f"[DEBUG] 自定义预设加载完成: {len(self.custom_manager.presets)} 个")
-            except Exception as e:
-                print(f"[DEBUG] 自定义预设加载失败: {e}")
+            except Exception as e:  # noqa: BLE001
+                # 【P0-⑥】预设加载属于"锦上添花"功能，失败只降级不致命：
+                # 宁可少几个自定义预设，也不能让应用起不来。
+                print(f"[DEBUG] 自定义预设加载失败（已忽略，应用继续启动）: "
+                      f"{type(e).__name__}: {e}")
 
         # 语音台词触发（B 方案：音频模板比对引擎，构造时无需加载重型模型）
+        self._draw_boot_screen("正在加载语音触发模块...")
         self.voice_trigger = None
         if VoiceTrigger is not None:
             try:
@@ -697,7 +795,7 @@ class SoulPlayerApp:
                     err = status.get("error") or status.get("status") or "未知原因"
                     self._add_log(f"🎤 语音未就绪: {err}")
                     print(f"[DEBUG] 语音引擎未就绪: {err}")
-            except Exception as e:
+            except (OSError, RuntimeError, AttributeError) as e:
                 print(f"[DEBUG] 语音触发初始化失败: {e}")
                 self._add_log("语音引擎初始化失败")
 
@@ -750,10 +848,14 @@ class SoulPlayerApp:
         # 常驻歌单面板滚动状态
         self._play_scroll = 0
         self._playlist_rect = None
-        # 底部信息区页签：动作特征 / 事件日志（折叠切换）
+        # 底部信息区页签：动作特征 / 事件日志 / 手机联动（折叠切换）
         self._bottom_tab = "features"
         self._bottom_tab_rects = []
-        self._tab_anim = {"features": 0.0, "log": 0.0}  # 页签 hover 缩放进度
+        self._tab_anim = {"features": 0.0, "log": 0.0, "sensor": 0.0}  # 页签 hover 缩放进度
+        # 手机联动：预留板块的数据层。传输层就位后，主循环里
+        # for ev in self.sensor_hub.poll(): self._handle_action(ev.action)
+        # 即可让手机动作与视觉动作走同一条执行与冷却链路。
+        self.sensor_hub = SensorLinkHub() if SensorLinkHub is not None else None
         # 音量调整后的数值回显弹标截止时间（0 表示不显示）
         self._vol_popup_until = 0.0
 
@@ -829,10 +931,15 @@ class SoulPlayerApp:
         sizes = [("large", 36), ("medium", 22), ("small", 16), ("tiny", 13)]
 
         if font_path:
-            for key, size in sizes:
-                self._fonts[key] = pygame.font.Font(font_path, size)
-            print(f"[DEBUG] 使用字体: {font_path}")
-        else:
+            try:
+                for key, size in sizes:
+                    self._fonts[key] = pygame.font.Font(font_path, size)
+                print(f"[DEBUG] 使用字体: {font_path}")
+            except pygame.error as e:
+                print(f"[WARNING] 主字体加载失败: {e}，回退到默认字体")
+                font_path = None  # 触发下方回退逻辑
+
+        if not font_path:
             print("[DEBUG] 未找到中文字体，回退到 pygame 默认字体（可能显示为方框）")
             # 回退到 pygame 内置的默认字体
             default_name = pygame.font.get_default_font()  # 通常是 "freesansbold.ttf"
@@ -847,7 +954,7 @@ class SoulPlayerApp:
             for key, size in sizes:
                 try:
                     self._fonts[key] = pygame.font.Font(default, size)
-                except Exception:
+                except pygame.error:
                     self._fonts[key] = pygame.font.Font(None, size)  # None 表示 pygame 默认字体
     def _font(self, key: str):
         return self._fonts.get(key, self._fonts['medium'])
@@ -882,6 +989,64 @@ class SoulPlayerApp:
                 f"SoulPlayer | 帧:{self._frame_count} | {state}"
             )
 
+    def _toggle_fullscreen(self):
+        """
+        F11 切换全屏/窗口模式（OBS 录制演示视频时隐藏桌面其他内容）。
+
+        使用 toggle_fullscreen 保持同一 surface，切回窗口时布局不变。
+        """
+        try:
+            pygame.display.toggle_fullscreen()
+            self._add_log("全屏/窗口切换 (F11)")
+        except pygame.error as e:
+            self._add_log(f"全屏切换失败: {e}")
+
+    def _map_mouse_pos(self, pos):
+        """
+        将鼠标事件坐标映射回逻辑坐标（幂等）。
+
+        RESIZABLE|SCALED 窗口放大后，pygame 的鼠标事件坐标（event.pos /
+        mouse.get_pos()）是物理窗口坐标（如 2560x1600），而 UI 的 rect 全部
+        基于逻辑分辨率（1280x720）构建，直接 collidepoint 永不命中
+        （"最大化后点击歌单/按钮无效"根因）。此函数把物理坐标按窗口缩放
+        比例映射回逻辑坐标；若坐标已在逻辑范围内（窗口未放大或 pygame 已
+        自行缩放），原样返回，不重复缩放。
+        """
+        try:
+            win_w, win_h = pygame.display.get_window_size()
+        except pygame.error:
+            return pos
+        if win_w <= 0 or win_h <= 0:
+            return pos
+        x, y = pos
+        # 幂等：已在逻辑分辨率范围内 → pygame 已缩放（或窗口未放大）
+        if x < self.WIN_WIDTH and y < self.WIN_HEIGHT:
+            return pos
+        return (x * self.WIN_WIDTH / win_w, y * self.WIN_HEIGHT / win_h)
+
+    # 【P0-①】自动切歌总开关：设置 SOULPLAYER_AUTO_ADVANCE=0 可一键关闭，
+    # 退回"播完即停"的原行为。判定源头 music_player.is_music_end_event 已拦截一次，
+    # 这里是第二道——即使过滤逻辑出错也能被用户彻底关闭。
+    AUTO_ADVANCE_ENV = "SOULPLAYER_AUTO_ADVANCE"
+
+    def _on_track_ended(self):
+        """
+        一首歌自然播完 → 自动播放下一首（P0-①）。
+
+        只在确实处于播放状态且歌单非空时切换；任何异常都只记日志，
+        绝不因此打断主循环或影响后续手动操作。
+        """
+        if os.environ.get(self.AUTO_ADVANCE_ENV, "").strip() == "0":
+            return
+        player = getattr(self, "player", None)
+        if player is None or not getattr(player, "_tracks", None):
+            return
+        try:
+            player.next_track()
+            self._add_log("⏭ 本首播完，自动播放下一首")
+        except Exception as e:  # noqa: BLE001
+            print(f"[自动切歌] 切换失败（已忽略）: {type(e).__name__}: {e}")
+
     def _handle_events(self):
         """处理 Pygame 事件：窗口关闭、键盘快捷键"""
         for event in pygame.event.get():
@@ -890,7 +1055,16 @@ class SoulPlayerApp:
                 print(f"[EVENT] type={event.type}, key={getattr(event, 'key', 'N/A')}, unicode={getattr(event, 'unicode', 'N/A')}")
             
             if event.type == pygame.QUIT:
+                self._exiting = True
                 self.running = False
+                continue
+
+            # 【P0-①】歌曲自然播放结束 → 自动切下一首。
+            # 必须放在所有模态分支之前：重命名/删除确认/歌单弹窗等分支末尾都有
+            # continue，若放在其后，开着弹窗时播完就会卡住不切歌。
+            player = getattr(self, "player", None)
+            if player is not None and player.is_music_end_event(event):
+                self._on_track_ended()
                 continue
 
             # 重命名输入模式：键盘事件全部进入输入框，不触发任何快捷键
@@ -915,7 +1089,7 @@ class SoulPlayerApp:
                         self._cancel_delete()
                 elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                     for rect, act in getattr(self, '_delete_btn_rects', []):
-                        if rect.collidepoint(event.pos):
+                        if rect.collidepoint(self._map_mouse_pos(event.pos)):
                             if act == 'confirm':
                                 self._confirm_delete()
                             else:
@@ -932,7 +1106,7 @@ class SoulPlayerApp:
                             self.anim.close_modal()
                 elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                     for rect, act in self._music_list_rects:
-                        if rect.collidepoint(event.pos):
+                        if rect.collidepoint(self._map_mouse_pos(event.pos)):
                             if act == "close":
                                 self._music_list_open = False
                                 if self.anim:
@@ -953,7 +1127,7 @@ class SoulPlayerApp:
                         self._cancel_song_select()
                 elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                     for rect, (act, idx) in self._song_select_rects:
-                        if rect.collidepoint(event.pos):
+                        if rect.collidepoint(self._map_mouse_pos(event.pos)):
                             if act == "toggle":
                                 self._toggle_song_select_row(idx)
                             elif act == "confirm":
@@ -975,7 +1149,7 @@ class SoulPlayerApp:
                         self._skip_section_select()
                 elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                     for rect, act in getattr(self, '_section_select_rects', []):
-                        if rect.collidepoint(event.pos):
+                        if rect.collidepoint(self._map_mouse_pos(event.pos)):
                             if act == "confirm":
                                 self._confirm_section_select()
                             elif act == "skip":
@@ -983,7 +1157,7 @@ class SoulPlayerApp:
                             elif act == "timeline":
                                 # 点击时间轴：按鼠标 x 定位段落并进入拖拽
                                 self._section_dragging = True
-                                pct = max(0.0, min(1.0, (event.pos[0] - rect.x) / max(1, rect.width)))
+                                pct = max(0.0, min(1.0, (self._map_mouse_pos(event.pos)[0] - rect.x) / max(1, rect.width)))
                                 self._section_select_set_start(pct)
                             elif act.startswith("preset:"):
                                 pct = float(act.split(":")[1])
@@ -993,7 +1167,7 @@ class SoulPlayerApp:
                     # 拖拽中：跟随鼠标 x 实时更新段落
                     for rect, act in getattr(self, '_section_select_rects', []):
                         if act == "timeline":
-                            pct = max(0.0, min(1.0, (event.pos[0] - rect.x) / max(1, rect.width)))
+                            pct = max(0.0, min(1.0, (self._map_mouse_pos(event.pos)[0] - rect.x) / max(1, rect.width)))
                             self._section_select_set_start(pct)
                             break
                 elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
@@ -1002,25 +1176,30 @@ class SoulPlayerApp:
 
             elif event.type == pygame.MOUSEWHEEL:
                 vlr = getattr(self, '_voice_list_rect', None)
-                if vlr and vlr.collidepoint(pygame.mouse.get_pos()):
+                if vlr and vlr.collidepoint(self._map_mouse_pos(pygame.mouse.get_pos())):
                     templates = []
                     if self.voice_trigger and hasattr(self.voice_trigger, 'list_templates'):
                         templates = self.voice_trigger.list_templates()
                     max_scroll = max(0, len(templates) - 3)
                     self._voice_scroll = max(0, min(self._voice_scroll - event.y, max_scroll))
                 plr = getattr(self, '_playlist_rect', None)
-                if plr and plr.collidepoint(pygame.mouse.get_pos()):
+                if plr and plr.collidepoint(self._map_mouse_pos(pygame.mouse.get_pos())):
                     self._play_scroll = max(0, self._play_scroll - event.y)
 
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 # 底部信息区页签切换
                 for rect, tab in getattr(self, '_bottom_tab_rects', []):
-                    if rect.collidepoint(event.pos):
+                    if rect.collidepoint(self._map_mouse_pos(event.pos)):
                         self._bottom_tab = tab
+                        break
+                # 常驻歌单面板：点击曲目行立即播放（快捷播放）
+                for row_rect, track_idx in getattr(self, '_playlist_rows', []):
+                    if row_rect.collidepoint(self._map_mouse_pos(event.pos)):
+                        self._play_from_music_list(track_idx)
                         break
                 # 音乐列表按钮：打开歌单弹窗
                 btn_rect = getattr(self, '_music_list_btn_rect', None)
-                if btn_rect and btn_rect.collidepoint(event.pos):
+                if btn_rect and btn_rect.collidepoint(self._map_mouse_pos(event.pos)):
                     self._music_list_open = True
                     self._music_list_scroll = 0
                     if self.anim:
@@ -1028,25 +1207,25 @@ class SoulPlayerApp:
                     continue
                 # 音量条点击/拖拽调节（热区在进度条上方，优先检测）
                 vol_rect = getattr(self, '_vol_bar_rect', None)
-                if vol_rect and vol_rect.collidepoint(event.pos):
+                if vol_rect and vol_rect.collidepoint(self._map_mouse_pos(event.pos)):
                     self._vol_dragging = True
-                    self._update_volume_from_mouse(event.pos[0])
+                    self._update_volume_from_mouse(self._map_mouse_pos(event.pos)[0])
                     continue
                 # 优先检测进度条点击
                 seek_rect = getattr(self, '_seek_bar_rect', None)
-                if seek_rect and seek_rect.collidepoint(event.pos):
+                if seek_rect and seek_rect.collidepoint(self._map_mouse_pos(event.pos)):
                     self._seek_dragging = True
-                    self._update_seek_from_mouse(event.pos[0])
+                    self._update_seek_from_mouse(self._map_mouse_pos(event.pos)[0])
                     continue
                 # 左键点击：优先预览框骨架显隐，其次语音模板编辑按钮，再次自定义预设
                 sk_rect = getattr(self, '_skeleton_btn_rect', None)
-                if sk_rect and sk_rect.collidepoint(event.pos):
+                if sk_rect and sk_rect.collidepoint(self._map_mouse_pos(event.pos)):
                     self._skeleton_visible = not self._skeleton_visible
                     self._add_log(f"🦴 动作骨架已{'显示' if self._skeleton_visible else '隐藏'}")
                     continue
                 voice_hit = False
                 for rect, tpl_name, action in getattr(self, '_voice_actions', []):
-                    if rect.collidepoint(event.pos):
+                    if rect.collidepoint(self._map_mouse_pos(event.pos)):
                         tracks = (self.voice_trigger.get_tracks(tpl_name)
                                   if self.voice_trigger else [])
                         if action == "rename":
@@ -1081,26 +1260,30 @@ class SoulPlayerApp:
                         voice_hit = True
                         break
                 if not voice_hit:
-                    self._handle_custom_preset_click(event.pos)
+                    self._handle_custom_preset_click(self._map_mouse_pos(event.pos))
 
             elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
                 if self._vol_dragging:
                     self._vol_dragging = False
-                    self._update_volume_from_mouse(event.pos[0])
+                    self._update_volume_from_mouse(self._map_mouse_pos(event.pos)[0])
                 if self._seek_dragging:
                     self._seek_dragging = False
-                    self._update_seek_from_mouse(event.pos[0])
+                    self._update_seek_from_mouse(self._map_mouse_pos(event.pos)[0])
 
             elif event.type == pygame.MOUSEMOTION:
                 if self._vol_dragging:
-                    self._update_volume_from_mouse(event.pos[0])
+                    self._update_volume_from_mouse(self._map_mouse_pos(event.pos)[0])
                 elif self._seek_dragging:
-                    self._update_seek_from_mouse(event.pos[0])
+                    self._update_seek_from_mouse(self._map_mouse_pos(event.pos)[0])
 
             elif event.type == pygame.KEYDOWN:
                 # 退出
                 if event.key in (pygame.K_ESCAPE, pygame.K_q):
+                    self._exiting = True
                     self.running = False
+                # 全屏/窗口切换（OBS 录制演示视频时隐藏桌面）
+                elif event.key == pygame.K_F11:
+                    self._toggle_fullscreen()
                 # 播放控制
                 elif event.key == pygame.K_SPACE:
                     if self.player.is_playing:
@@ -1156,7 +1339,7 @@ class SoulPlayerApp:
         try:
             self.player.set_volume(vol)
             self._vol_popup_until = time.time() + 1.2
-        except Exception:
+        except (AttributeError, RuntimeError):
             pass
 
     def _update_seek_from_mouse(self, mouse_x: int):
@@ -1170,7 +1353,7 @@ class SoulPlayerApp:
             dur = self.player.get_track_duration()
             if dur > 0:
                 self.player.seek_to(progress * dur)
-        except Exception:
+        except (AttributeError, RuntimeError):
             pass
 
     def _update(self):
@@ -1226,7 +1409,7 @@ class SoulPlayerApp:
 
         try:
             self.current_features = self.motion.get_latest_motion_features()
-        except Exception as e:
+        except (RuntimeError, AttributeError) as e:
             self._add_log(f"获取动作特征异常: {e}")
             return
         # 更新动画系统（特征值平滑过渡等）
@@ -1288,7 +1471,7 @@ class SoulPlayerApp:
                 and getattr(self.voice_trigger, 'speech_active', False)
             )
             playing = bool(self.player.is_playing)
-        except Exception:
+        except (AttributeError, RuntimeError):
             return
         if speech and playing:
             self._duck_until = now + 1.5
@@ -1296,14 +1479,28 @@ class SoulPlayerApp:
                 self._voice_ducked = float(getattr(self.player, '_volume', 0.5))
                 try:
                     self.player.set_volume(max(0.12, self._voice_ducked * 0.45))
-                except Exception:
+                except (AttributeError, RuntimeError):
                     self._voice_ducked = None
         elif self._voice_ducked is not None and now >= self._duck_until:
             try:
                 self.player.set_volume(self._voice_ducked)
-            except Exception:
+            except (AttributeError, RuntimeError):
                 pass
             self._voice_ducked = None
+
+    def _apply_window_icon(self):
+        """设置窗口图标（任务栏 / Alt+Tab）。资源缺失时静默跳过。"""
+        try:
+            base = app_paths.resource_dir() if app_paths is not None else Path(__file__).parent
+            for rel in ("assets/soulplayer.png", "soulplayer.png"):
+                p = base / rel
+                if p.is_file():
+                    pygame.display.set_icon(pygame.image.load(str(p)))
+                    print(f"[DEBUG] 窗口图标已加载: {p}")
+                    return
+            print("[DEBUG] 未找到窗口图标资源（忽略）")
+        except (pygame.error, OSError) as e:
+            print(f"[DEBUG] 窗口图标加载失败（忽略）: {e}")
 
     def _music_dir(self) -> Path:
         """
@@ -1323,6 +1520,9 @@ class SoulPlayerApp:
             exe_dir = Path(sys.executable).parent
             candidates.append(exe_dir.parent.parent / "music")  # 项目源码目录
             candidates.append(exe_dir / "music")                # exe 旁边
+            if app_paths is not None:
+                # 安装到 Program Files 时前两个都不可写，用户曲库放这里
+                candidates.append(app_paths.data_root() / "music")
         candidates.append(Path(__file__).parent / "music")      # 源码 / _internal
 
         for c in candidates:
@@ -1337,78 +1537,41 @@ class SoulPlayerApp:
         for c in candidates:
             if c.is_dir():
                 return c
-        fallback = candidates[0]
-        try:
-            fallback.mkdir(parents=True, exist_ok=True)
-        except OSError:
-            pass
-        return fallback
+        # 都不存在：挑第一个真能创建的（安装目录可能只读）
+        for c in candidates:
+            try:
+                c.mkdir(parents=True, exist_ok=True)
+                return c
+            except OSError:
+                continue
+        return candidates[0]
 
     def _data_dir(self, name: str) -> Path:
         """
         统一的用户数据目录定位（自定义动作预设、语音台词模板等）。
 
-        与 _music_dir() 同理：打包成 exe 后数据若只存在 _internal 里，
-        重新打包时整个 dist 会被删除导致数据丢失；且源码运行与 exe 运行
-        读到的不是同一份数据，导致"上次录的台词下次打开触发别的模板"。
-        因此按优先级探测：项目源码目录 > exe 旁边 > _internal/脚本目录，
-        选第一个"存在且非空"的目录；若它不是首选目录，则把内容
-        （连同配套的 <name>.json 映射文件，位于目录的上一级）复制到
-        首选目录后返回首选；迁移失败时沿用原目录。
+        与 _music_dir() 同理：数据写在安装目录里，重装或升级就丢；
+        而安装到 Program Files 后目录本身是只读的，写入会静默失败。
+        定位统一交给 app_paths：
+          - 开发态    源码目录（与旧行为完全一致）
+          - 便携模式  exe 旁边（存在 portable.flag）
+          - 安装版    %LOCALAPPDATA%\\SoulPlayer
+        目标目录为空时从旧位置一次性迁移，避免"一升级录制全丢"。
         """
-        candidates = []
-        if getattr(sys, 'frozen', False):
-            exe_dir = Path(sys.executable).parent
-            candidates.append(exe_dir.parent.parent / name)  # 项目源码目录
-            candidates.append(exe_dir / name)                # exe 旁边
-        candidates.append(Path(__file__).parent / name)      # 源码 / _internal
-
-        def _has_content(d: Path) -> bool:
+        if app_paths is not None:
             try:
-                return d.is_dir() and any(d.iterdir())
-            except OSError:
-                return False
+                return app_paths.data_dir(
+                    name, migrate_from=app_paths.legacy_candidates(name))
+            except Exception as e:  # noqa: BLE001
+                # 路径层异常绝不能阻断启动
+                print(f"[警告] 数据目录定位失败，退回源码目录: {e}")
 
-        chosen = None
-        for c in candidates:
-            if _has_content(c):
-                chosen = c
-                break
-        if chosen is None:
-            for c in candidates:
-                if c.is_dir():
-                    chosen = c
-                    break
-        if chosen is None:
-            chosen = candidates[0]
-            try:
-                chosen.mkdir(parents=True, exist_ok=True)
-            except OSError:
-                pass
-            return chosen
-
-        preferred = candidates[0]
-        if chosen != preferred:
-            try:
-                preferred.mkdir(parents=True, exist_ok=True)
-                for item in chosen.iterdir():
-                    dest = preferred / item.name
-                    if dest.exists():
-                        continue
-                    if item.is_dir():
-                        shutil.copytree(item, dest)
-                    else:
-                        shutil.copy2(item, dest)
-                # 配套映射文件（如 voice_templates.json）与目录同级
-                sidecar_src = chosen.parent / f"{name}.json"
-                sidecar_dst = preferred.parent / f"{name}.json"
-                if sidecar_src.is_file() and not sidecar_dst.exists():
-                    shutil.copy2(sidecar_src, sidecar_dst)
-                print(f"[数据迁移] {name}: {chosen} -> {preferred}")
-                return preferred
-            except OSError as e:
-                print(f"[数据迁移失败，沿用原目录] {name}: {e}")
-        return chosen
+        fallback = Path(__file__).parent / name
+        try:
+            fallback.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+        return fallback
 
     def _sync_music_folder(self):
         """每 2 秒调用一次：检测 music 文件夹中新增/移除的歌曲并同步播放列表。"""
@@ -1423,63 +1586,112 @@ class SoulPlayerApp:
                 self._add_log(f"🎵 检测到新歌曲: {names}{suffix}")
             if removed:
                 self._add_log(f"🗑 {len(removed)} 首歌曲已从文件夹移除")
-        except Exception as e:
+        except (OSError, RuntimeError) as e:
             print(f"[DEBUG] 音乐文件夹扫描异常: {e}")
+
+    def _check_action_cooldown(self, action: str) -> bool:
+        """按 ACTION_COOLDOWN_RULES 判断本次动作是否放行。
+
+        返回 True 表示放行（顺带已登记时间戳），False 表示仍在冷却期内。
+        未在表中登记的动作不设冷却，一律放行。
+        """
+        rule = ACTION_COOLDOWN_RULES.get(action)
+        if rule is None:
+            return True
+        now = time.time()
+        # 自身冷却：同一动作的重复触发
+        if now - self._action_cooldowns.get(action, 0.0) < rule.self_cd:
+            return False
+        # 配对冷却：next/prev 这类双向动作互相约束
+        for peer in rule.peers:
+            if now - self._action_cooldowns.get(peer, 0.0) < rule.peer_cd:
+                return False
+        # 放行：登记自身时间戳，并连带压制特征相近、容易混淆的动作
+        self._action_cooldowns[action] = now
+        for extra in rule.also_block:
+            self._action_cooldowns[extra] = now
+        return True
 
     def _handle_action(self, action: str):
         """
         将预设动作映射到播放器指令。
         与 ARCHITECTURE.md 中 handle_action 定义保持一致。
-        对瞬时动作（pause/play/next/prev）添加 1 秒冷却期，防止连续触发。
+        冷却规则集中在 ACTION_COOLDOWN_RULES，防止连续触发。
         """
-        # 挥手方向冷却（同向/反向分离）：
-        # - 同向冷却 0.35s：防止同方向机关枪式连发（match 每帧返回），
-        #   但间隔 >0.35s 的同向连续挥手可正常触发 → 连贯切歌不受影响；
-        # - 反向冷却 0.9s：挥完收手的"回正"是一次紧跟触发的反向横扫
-        #   （挥右切下一首后把手收回 = 向左横扫），若冷却太短会被误判为
-        #   "上一首"——"收手时最容易串成反向"的根因。0.9s 覆盖完整
-        #   收手过程（挥出+收回约 0.4~0.8s）；真正想切反方向需间隔 >0.9s，
-        #   与 direction 首段判定（motion_capture 侧）双保险。
-        _WAVE_ACTIONS = {"player_next", "player_prev"}
-        if action in _WAVE_ACTIONS:
-            now = time.time()
-            other = "player_prev" if action == "player_next" else "player_next"
-            last_same = self._action_cooldowns.get(action, 0.0)
-            last_other = self._action_cooldowns.get(other, 0.0)
-            if now - last_same < 0.35 or now - last_other < 0.9:
-                return
-            self._action_cooldowns[action] = now
-            # 挥手触发后同步屏蔽自定义：挥手的收手/回正余波与自定义动作
-            # 的轨迹/特征模板相近，若不屏蔽，余波会被识别为自定义动作
-            # 播放（"做通用动作却串自定义动作"的根因，与下方 custom_play
-            # 屏蔽 player_wave 形成双向隔离）。
-            self._action_cooldowns["custom_play"] = now
+        # ── 学习系统集成：记录最近触发的动作（用于UI确认） ──
+        now = time.time()
+        self.recent_actions.append({
+            'action': action,
+            'timestamp': now
+        })
+        # 只保留最近5条记录（5秒足够）
+        if len(self.recent_actions) > 5:
+            self.recent_actions.pop(0)
 
-        # 瞬时动作冷却期：1 秒内不重复触发同一动作
-        # custom_play 也在内：自定义条件在触发后仍会持续满足若干帧，
-        # 不冷却会每帧重启歌曲（"机关枪"式重触发）
-        _COOLDOWN_ACTIONS = {"player_pause", "player_play", "custom_play"}
-        if action in _COOLDOWN_ACTIONS:
-            now = time.time()
-            last_trigger = self._action_cooldowns.get(action, 0.0)
-            if now - last_trigger < 1.0:
-                return  # 冷却期内，忽略本次触发
-            self._action_cooldowns[action] = now
+        # ── 声明式动作冷却（规则集中见 ACTION_COOLDOWN_RULES）──
+        # 未在表中登记的动作不设冷却，一律放行。
+        # 各动作为何是这个数值、为何要连带压制别的动作，见表内注释。
+        if not self._check_action_cooldown(action):
+            return  # 冷却期内，忽略本次触发
 
-        # 自定义动作与挥手切歌互斥：自定义动作触发后 1 秒内屏蔽下一首/上一首。
-        # 自定义动作的收手/回正余波与挥手特征相似，若不屏蔽会被识别为挥手误切歌。
-        #（player_wave 旧共用 key 已拆分为 player_next/player_prev 双向）
-        if action == "custom_play":
-            _cw = time.time()
-            self._action_cooldowns["player_next"] = _cw
-            self._action_cooldowns["player_prev"] = _cw
+        # ── 挥手灵敏度诊断（临时开关，校准门槛用）──
+        # 设 SOULPLAYER_WAVE_DIAG=1 后，每次挥手触发都把当帧特征追加到
+        # _wave_diag.log。用途：分清"真挥手"与"轻摆误触"的实际跨度分布，
+        # 据此定 arm_horizontal_motion 的 min 值，而不是靠猜。
+        # 平时关闭，避免日志噪音；校准完可一直关着。
+        if (action in ("player_next", "player_prev")
+                and os.environ.get("SOULPLAYER_WAVE_DIAG") == "1"):
+            try:
+                _f = self.current_features or {}
+                with open("_wave_diag.log", "a", encoding="utf-8") as _fh:
+                    _fh.write(
+                        f"{time.strftime('%H:%M:%S')} {action:<12} "
+                        f"arm_h={_f.get('arm_horizontal_motion', -1):.3f} "
+                        f"wave_dir={_f.get('wave_direction', 0):+.1f} "
+                        f"motion={_f.get('motion_energy', -1):.3f}\n")
+            except Exception:
+                pass  # 诊断绝不影响主流程
+
+        # ── v2.5: 学习系统集成 - 记录P1触发结果 ──
+        # 在动作实际执行前，记录学习数据
+        if action in ("player_next", "player_prev", "player_pause", "player_play"):
+            if hasattr(self, 'motion') and self.motion:
+                if hasattr(self.motion, 'record_wave_trigger'):
+                    try:
+                        # 获取当前挥手信息
+                        wave_info = self.motion.get_current_wave_info()
+                        hand = wave_info.get('hand', 'L')  # 默认左手
+                        direction = wave_info.get('direction', 0.0)
+
+                        # 映射action到direction
+                        if action == "player_next":
+                            direction = 1.0 if direction == 0.0 else direction
+                        elif action == "player_prev":
+                            direction = -1.0 if direction == 0.0 else direction
+                        else:
+                            # pause/play不使用direction
+                            direction = 0.0
+
+                        # 记录触发结果（假设触发成功，置信度0.8）
+                        confidence = 0.8 if action in ("player_next", "player_prev") else 1.0
+                        triggered = True
+
+                        self.motion.record_wave_trigger(
+                            hand=hand,
+                            direction=direction,
+                            triggered=triggered,
+                            confidence=confidence
+                        )
+                    except Exception as e:
+                        if self._debug:
+                            print(f"[学习系统] 记录触发失败: {e}")
 
         if action.startswith("mood_"):
             mood = action.replace("mood_", "")
             try:
                 self.player.set_playlist_by_mood(mood)
                 self._add_log(f"切换情绪列表: {mood}")
-            except Exception as e:
+            except (AttributeError, RuntimeError, pygame.error) as e:
                 self._add_log(f"切换列表失败: {e}")
         elif action == "player_pause":
             self.player.pause()
@@ -1488,12 +1700,12 @@ class SoulPlayerApp:
         elif action == "player_next":
             try:
                 self.player.next_track()
-            except Exception as e:
+            except (AttributeError, RuntimeError, pygame.error) as e:
                 self._add_log(f"下一首失败: {e}")
         elif action == "player_prev":
             try:
                 self.player.previous_track()
-            except Exception as e:
+            except (AttributeError, RuntimeError, pygame.error) as e:
                 self._add_log(f"上一首失败: {e}")
         elif action == "custom_play":
             if self.custom_manager:
@@ -1511,7 +1723,7 @@ class SoulPlayerApp:
                             start_pct = getattr(preset, 'start_pct', 0.0) or 0.0
                         self._seek_to_start_pct(start_pct)
                         self._add_log(f"自定义播放: {os.path.basename(track)}")
-                    except Exception as e:
+                    except (AttributeError, RuntimeError, pygame.error) as e:
                         self._add_log(f"播放失败: {e}")
                 else:
                     self._add_log("无有效歌曲")
@@ -1528,7 +1740,7 @@ class SoulPlayerApp:
                         start_pct = self.voice_trigger.get_start_pct(phrase)
                         self._seek_to_start_pct(start_pct)
                         self._add_log(f"🎤 台词 [{phrase}] 播放: {os.path.basename(track)}")
-                    except Exception as e:
+                    except (AttributeError, RuntimeError, pygame.error) as e:
                         self._add_log(f"播放失败: {e}")
                 else:
                     self._add_log(f"台词 [{phrase}] 没有关联歌曲")
@@ -1543,7 +1755,7 @@ class SoulPlayerApp:
             duration = self.player.get_track_duration()
             if duration and duration > 0:
                 self.player.seek_to(start_pct * duration)
-        except Exception:
+        except (AttributeError, RuntimeError, pygame.error):
             pass
 
     # ---------- 语音监听控制 ----------
@@ -1556,7 +1768,7 @@ class SoulPlayerApp:
             title = (track.get('title') or track.get('filename')
                      or f"曲目 {idx + 1}") if isinstance(track, dict) else f"曲目 {idx + 1}"
             self._add_log(f"手动选择播放: {title}")
-        except Exception as e:
+        except (AttributeError, RuntimeError, pygame.error) as e:
             self._add_log(f"播放失败: {e}")
 
     def _toggle_voice_listening(self):
@@ -1700,7 +1912,7 @@ class SoulPlayerApp:
             # 录音前临时暂停正在播放的音乐，避免扬声器声音被麦克风录入
             try:
                 playing_now = bool(self.player.is_playing)
-            except Exception:
+            except (AttributeError, RuntimeError):
                 playing_now = False
             self._voice_rec = {"phase": "countdown", "t0": now,
                                "auto_started": False, "resume_play": playing_now}
@@ -1708,7 +1920,7 @@ class SoulPlayerApp:
                 try:
                     self.player.pause()
                     self._add_log("⏸ 已临时暂停音乐，保证录音清晰")
-                except Exception as e:
+                except (AttributeError, RuntimeError, pygame.error) as e:
                     print(f"[临时暂停失败] {e}")
                     self._voice_rec["resume_play"] = False
             self._add_log("⏳ 3秒后开始语音录制，请准备台词...")
@@ -1750,7 +1962,7 @@ class SoulPlayerApp:
             try:
                 self.player.play()  # 暂停状态下 play() 即恢复播放
                 self._add_log("▶ 音乐已恢复播放")
-            except Exception as e:
+            except (AttributeError, RuntimeError, pygame.error) as e:
                 print(f"[恢复播放失败] {e}")
 
     def _finish_voice_recording(self):
@@ -1937,7 +2149,7 @@ class SoulPlayerApp:
         visible = list_rect.height // row_h
         max_scroll = max(0, len(sel["songs"]) - visible)
         sel["scroll"] = max(0, min(sel["scroll"], max_scroll))
-        mouse_pos = pygame.mouse.get_pos()
+        mouse_pos = self._map_mouse_pos(pygame.mouse.get_pos())
 
         old_clip = self.screen.get_clip()
         self.screen.set_clip(list_rect)
@@ -2024,7 +2236,7 @@ class SoulPlayerApp:
         info = {}
         try:
             info = self.player.get_playlist_info()
-        except Exception:
+        except (AttributeError, RuntimeError):
             pass
         tracks = info.get("tracks", []) or []
         current_idx = info.get("current_index", -1)
@@ -2041,7 +2253,7 @@ class SoulPlayerApp:
         visible = list_rect.height // row_h
         max_scroll = max(0, len(tracks) - visible)
         self._music_list_scroll = max(0, min(self._music_list_scroll, max_scroll))
-        mouse_pos = pygame.mouse.get_pos()
+        mouse_pos = self._map_mouse_pos(pygame.mouse.get_pos())
 
         if not tracks:
             hint = self._font('small').render("暂无曲目，请将音乐文件放入 music/ 文件夹", True, muted)
@@ -2132,7 +2344,7 @@ class SoulPlayerApp:
             True, muted)
         self.screen.blit(sub, (box.x + 20, box.y + 46))
 
-        mouse_pos = pygame.mouse.get_pos()
+        mouse_pos = self._map_mouse_pos(pygame.mouse.get_pos())
         self._section_select_rects = []
 
         # 预设段落按钮
@@ -2188,8 +2400,39 @@ class SoulPlayerApp:
         hint = self._font('tiny').render("Enter 确认  |  Esc 跳过（默认从头播放）", True, muted)
         self.screen.blit(hint, (box.x + 300, box.bottom - 42))
 
+    def _draw_boot_screen(self, msg: str):
+        """启动加载画面：重量级初始化期间给出可见反馈，避免长时间黑屏。
+
+        背景：窗口在 __init__ 一开始就创建了，但动作捕捉/语音等模块初始化
+        可能耗时数十秒（尤其语音嵌入模型联网失败时），此前这期间窗口全黑，
+        用户会误以为程序卡死。此方法在初始化各阶段间刷新一帧提示。
+        """
+        try:
+            bg = SoulTheme.BG_DEEP if SoulTheme else self.COLOR_BG
+            self.screen.fill(bg)
+            title = self._font('large').render("SoulPlayer", True, self.COLOR_TEXT)
+            tip = self._font('small').render(msg, True, self.COLOR_TEXT_DIM)
+            self.screen.blit(title, title.get_rect(
+                center=(self.WIN_WIDTH // 2, self.WIN_HEIGHT // 2 - 30)))
+            self.screen.blit(tip, tip.get_rect(
+                center=(self.WIN_WIDTH // 2, self.WIN_HEIGHT // 2 + 20)))
+            pygame.display.flip()
+            pygame.event.pump()  # 让窗口保持响应状态，不显示"未响应"
+        except Exception:
+            pass  # 加载画面失败不影响启动
+
     def _render(self):
         """渲染一帧画面到屏幕"""
+        # 退出提示（在正常渲染之前，确保能立即显示）
+        if self._exiting:
+            self.screen.fill((30, 30, 30))  # 深灰背景
+            exit_msg = self._font('large').render("正在退出...", True, (255, 255, 255))
+            hint_msg = self._font('small').render("请稍候，正在保存数据", True, (180, 180, 180))
+            self.screen.blit(exit_msg, exit_msg.get_rect(center=(self.WIN_WIDTH//2, self.WIN_HEIGHT//2 - 20)))
+            self.screen.blit(hint_msg, hint_msg.get_rect(center=(self.WIN_WIDTH//2, self.WIN_HEIGHT//2 + 30)))
+            pygame.display.flip()
+            return  # 直接返回，不继续渲染
+
         # 使用新主题背景色（近黑深底）+ 环境辉光（Ethereal Glass 氛围）
         bg = SoulTheme.BG_DEEP if SoulTheme else self.COLOR_BG
         self.screen.fill(bg)
@@ -2429,7 +2672,7 @@ class SoulPlayerApp:
                                                    line_color=SoulTheme.ACCENT,
                                                    line_width=2, dot_radius=3,
                                                    offset=preview_rect)
-                        except Exception:
+                        except (TypeError, AttributeError, ValueError, IndexError):
                             pass
                         # 手部 21 点细骨架（HandLandmarker，虚拟博主式）
                         if draw_hand_skeleton:
@@ -2443,7 +2686,7 @@ class SoulPlayerApp:
                                             line_color=(255, 200, 80),
                                             line_width=2, dot_radius=2,
                                             offset=preview_rect)
-                                    except Exception:
+                                    except (TypeError, AttributeError, ValueError, IndexError):
                                         pass
                 else:
                     placeholder = self._font('small').render("帧格式不支持", True,
@@ -2453,7 +2696,7 @@ class SoulPlayerApp:
                 placeholder = self._font('small').render("等待摄像头...", True,
                                                               SoulTheme.TEXT_MUTED if SoulTheme else self.COLOR_TEXT_DIM)
                 self.screen.blit(placeholder, (x + 100, y + 120))
-        except Exception as e:
+        except (pygame.error, TypeError, AttributeError, ValueError) as e:
             err = self._font('small').render(f"预览错误: {e}", True,
                                               SoulTheme.TEXT_MUTED if SoulTheme else self.COLOR_TEXT_DIM)
             self.screen.blit(err, (x + 10, y + 120))
@@ -2489,13 +2732,13 @@ class SoulPlayerApp:
         info = {}
         try:
             info = self.player.get_playlist_info()
-        except Exception:
+        except (AttributeError, RuntimeError):
             pass
         tracks = info.get("tracks", []) or []
         current_idx = info.get("current_index", -1)
         self.ui.label(rect.right - 16, y + 14, f"{len(tracks)} TRACKS",
                       self._font('tiny'), color=SoulTheme.TEXT_MUTED, anchor="topright")
-        mouse = pygame.mouse.get_pos()
+        mouse = self._map_mouse_pos(pygame.mouse.get_pos())
         VISIBLE = 5
         row_h = 26
         list_y = y + 44
@@ -2503,6 +2746,8 @@ class SoulPlayerApp:
         self._playlist_rect = pygame.Rect(x + 14, list_y, rect.width - 28, list_h)
         max_scroll = max(0, len(tracks) - VISIBLE)
         self._play_scroll = max(0, min(getattr(self, '_play_scroll', 0), max_scroll))
+        # 可见曲目行热区（供点击即播放）：[(行 rect, 播放器索引), ...]
+        self._playlist_rows = []
         ry = list_y
         for i in range(self._play_scroll, self._play_scroll + VISIBLE):
             if i >= len(tracks):
@@ -2511,6 +2756,7 @@ class SoulPlayerApp:
             if isinstance(name, dict):
                 name = name.get('title', '?')
             row = pygame.Rect(x + 14, ry, rect.width - 28, row_h - 4)
+            self._playlist_rows.append((row, i))
             hovered = row.collidepoint(mouse)
             current = (i == current_idx)
             if current:
@@ -2632,7 +2878,7 @@ class SoulPlayerApp:
         # 右上角：音乐列表按钮（点击打开歌单弹窗）
         btn_rect = pygame.Rect(x + panel_w - 92, y + 8, 80, 26)
         self._music_list_btn_rect = btn_rect
-        btn_hover = btn_rect.collidepoint(pygame.mouse.get_pos())
+        btn_hover = btn_rect.collidepoint(self._map_mouse_pos(pygame.mouse.get_pos()))
         if self.ui and SoulTheme:
             btn_bg = SoulTheme.BG_HOVER if btn_hover else SoulTheme.BG_CARD
             self.ui.rounded_rect(btn_rect, btn_bg, radius=SoulTheme.RADIUS_BTN,
@@ -2759,10 +3005,10 @@ class SoulPlayerApp:
             dur = self.player.get_track_duration()
             if dur > 0:
                 progress = min(1.0, max(0.0, pos / dur))
-        except Exception:
+        except (AttributeError, RuntimeError, ZeroDivisionError):
             pass
 
-        mouse_pos = pygame.mouse.get_pos()
+        mouse_pos = self._map_mouse_pos(pygame.mouse.get_pos())
         bar_rect = pygame.Rect(x, y, width, bar_h + 4)
         # 悬停检测区域稍大
         self._seek_hovered = bar_rect.collidepoint(mouse_pos)
@@ -2800,7 +3046,7 @@ class SoulPlayerApp:
                 time_text = f"{pos_str} / {dur_str}"
             else:
                 time_text = "--:-- / --:--"
-        except Exception:
+        except (AttributeError, RuntimeError, TypeError):
             time_text = "--:-- / --:--"
         # 拖拽中时间文本用强调色（数值回显反馈）
         if self._seek_dragging:
@@ -2962,7 +3208,7 @@ class SoulPlayerApp:
             text_c = SoulTheme.TEXT_PRIMARY if SoulTheme else self.COLOR_TEXT
             muted = SoulTheme.TEXT_MUTED if SoulTheme else self.COLOR_TEXT_DIM
             danger = SoulTheme.DANGER if SoulTheme else (220, 90, 90)
-            mouse_pos = pygame.mouse.get_pos()
+            mouse_pos = self._map_mouse_pos(pygame.mouse.get_pos())
             VISIBLE_ROWS = 3
             row_h = 26
             list_y = y + 70
@@ -3038,9 +3284,9 @@ class SoulPlayerApp:
             pygame.draw.rect(self.screen, self.COLOR_PANEL, (x, y, 560, h))
 
         # 页签栏（点击切换 + hover 缩放动效）
-        tabs = [("features", "动作特征"), ("log", "事件日志")]
+        tabs = [("features", "动作特征"), ("log", "事件日志"), ("sensor", "手机联动")]
         tx = x + 15
-        mouse_pos = pygame.mouse.get_pos()
+        mouse_pos = self._map_mouse_pos(pygame.mouse.get_pos())
         for key, label in tabs:
             active = (self._bottom_tab == key)
             base = pygame.Rect(tx, y + 8, 88, 24)
@@ -3076,6 +3322,8 @@ class SoulPlayerApp:
         content_y = y + 40
         if self._bottom_tab == "features":
             self._draw_feature_panel(x + 15, content_y, title=False)
+        elif self._bottom_tab == "sensor":
+            self._draw_sensor_link_panel(x + 15, content_y, h)
         else:
             max_lines = max(1, min(4, (h - 48) // 17))
             for i, (msg, t) in enumerate(self.log_messages[-max_lines:]):
@@ -3091,6 +3339,55 @@ class SoulPlayerApp:
                 else:
                     line = self._font('tiny').render(msg, True, color)
                     self.screen.blit(line, (x + 15, content_y + i * 17))
+
+    def _draw_sensor_link_panel(self, x: int, y: int, h: int = 100):
+        """「手机联动」预留面板。
+
+        本轮只做状态回显：判定链已在手机端（mobile/）就绪并经合成 IMU
+        回归验证，事件协议与状态机已在 sensor_link.py 定义。网络传输层
+        就位后，这里显示的"最近事件"就会活起来，动作直接走 _handle_action
+        与视觉动作共用冷却——这正是把它放在页签里而不是弹窗里的原因：
+        它是常驻通道的仪表位，不是一次性功能入口。
+        """
+        if self.sensor_hub is not None:
+            info = self.sensor_hub.summary()
+        else:
+            info = {"state": "不可用", "status": "sensor_link 模块缺失", "last": "-",
+                    "last_age": None, "rejected": 0, "pending": 0}
+
+        accent = SoulTheme.ACCENT if SoulTheme else self.COLOR_ACCENT
+        text_c = SoulTheme.TEXT_SECONDARY if SoulTheme else self.COLOR_TEXT_DIM
+        muted = SoulTheme.TEXT_MUTED if SoulTheme else self.COLOR_TEXT_DIM
+        font_s = self._font('small')
+        font_t = self._font('tiny')
+
+        # 状态行：圆点颜色跟随链路状态，和顶部状态灯同一套语义
+        dot_color = {"已连接": (134, 176, 111), "异常": (201, 106, 92)}.get(info["state"], muted)
+        dot_r = 3
+        cy = y + 8
+        pygame.draw.circle(self.screen, dot_color, (x + 5, cy + 7), dot_r)
+        surf = font_s.render(f"{info['state']} · {info['status']}", True, text_c)
+        self.screen.blit(surf, (x + 16, cy))
+        cy += 20
+
+        last_age = info.get("last_age")
+        last_text = info.get("last", "-")
+        if last_age is not None:
+            last_text += f"（{last_age:.1f}s 前）"
+        surf = font_t.render(f"最近事件  {last_text}", True, text_c)
+        self.screen.blit(surf, (x, cy))
+        cy += 17
+
+        surf = font_t.render(
+            f"待处理 {info.get('pending', 0)} · 已拒绝 {info.get('rejected', 0)}",
+            True, muted)
+        self.screen.blit(surf, (x, cy))
+        cy += 19
+
+        surf = font_t.render(
+            "手机端判定 → 动作事件 → 本端冷却执行；传输层待接入（见 sensor_link.py）",
+            True, accent)
+        self.screen.blit(surf, (x, cy))
 
     def _draw_log_panel(self, x: int, y: int, h: int = 100):
         """绘制实时日志面板（新主题，高度可随语音面板扩展而压缩）"""
@@ -3222,7 +3519,7 @@ class SoulPlayerApp:
             self.screen.blit(label, (x + 10, y + 8))
 
         presets = self.custom_manager.get_display_presets()[:4]  # 右列最多 4 张
-        mouse_pos = pygame.mouse.get_pos()
+        mouse_pos = self._map_mouse_pos(pygame.mouse.get_pos())
         self._custom_cards = []    # [(Rect, preset)] 供点击命中检测
         self._custom_actions = []  # [(Rect, action, preset)] 编辑按钮
         hovered_preset = None
@@ -3232,7 +3529,7 @@ class SoulPlayerApp:
             if t:
                 try:
                     return Path(str(t[0])).stem
-                except Exception:
+                except (TypeError, AttributeError, OSError):
                     return "未绑定曲目"
             return "未绑定曲目"
 
@@ -3387,7 +3684,7 @@ class SoulPlayerApp:
         """
         try:
             import tkinter as tk
-        except Exception:
+        except ImportError:
             print("[DEBUG] Tk 输入对话框不可用，退回内联输入")
             return None
 
@@ -3605,7 +3902,7 @@ class SoulPlayerApp:
         self.screen.blit(sub, (box.x + 20, box.y + 76))
 
         # 按钮：确认删除 / 取消
-        mouse_pos = pygame.mouse.get_pos()
+        mouse_pos = self._map_mouse_pos(pygame.mouse.get_pos())
         btn_confirm = pygame.Rect(box.x + 20, box.y + 104, 120, 32)
         btn_cancel = pygame.Rect(box.x + 156, box.y + 104, 120, 32)
         self._delete_btn_rects = [(btn_confirm, 'confirm'), (btn_cancel, 'cancel')]
@@ -3621,28 +3918,184 @@ class SoulPlayerApp:
         self.screen.blit(hint, (box.x + 300, box.y + 112))
 
 
-    def _cleanup(self):
-        """安全关闭所有资源"""
-        self._add_log("正在关闭系统...")
+    def _safe_stop_motion(self):
+        """【P0-⑤】在退出线程中释放动作捕捉资源（摄像头/detector/推理线程）。"""
+        t0 = time.time()
         try:
-            self.motion.stop()
-        except Exception as e:
-            print(f"关闭动作捕捉异常: {e}")
+            if self.motion is not None and hasattr(self.motion, 'stop'):
+                self.motion.stop()
+                print(f"[退出] 动作捕捉资源已释放（{time.time() - t0:.2f}s）")
+        except Exception as e:  # noqa: BLE001
+            print(f"[退出] motion.stop() 异常（已忽略）: "
+                  f"{type(e).__name__}: {e}（{time.time() - t0:.2f}s）")
+
+    def _safe_save_learning_data(self):
+        """【P0-⑤】保存学习数据，吞掉所有异常：退出路径不应因保存失败而卡住。"""
+        try:
+            if self.motion is not None:
+                self.motion.save_wave_learning_data()
+        except Exception as e:  # noqa: BLE001
+            print(f"[退出] 保存学习数据失败（已忽略）: {type(e).__name__}: {e}")
+
+    def _cleanup(self):
+        """安全关闭所有资源（极速退出优化）"""
+        # 先显示退出提示（避免用户以为程序卡死）
+        try:
+            self.screen.fill((30, 30, 30))
+            exit_msg = self._font('large').render("正在退出...", True, (255, 255, 255))
+            hint_msg = self._font('small').render("请稍候，正在保存数据", True, (180, 180, 180))
+            self.screen.blit(exit_msg, exit_msg.get_rect(center=(self.WIN_WIDTH//2, self.WIN_HEIGHT//2 - 20)))
+            self.screen.blit(hint_msg, hint_msg.get_rect(center=(self.WIN_WIDTH//2, self.WIN_HEIGHT//2 + 30)))
+            pygame.display.flip()
+        except Exception:
+            pass
+
+        self._add_log("正在关闭系统...")
+
+        # 【P0-⑤】退出时的资源释放策略
+        # 原实现是"极速退出"：只置 _running_flag = False 就返回。这样绕过了
+        # motion.stop()，摄像头 cap.release() 与 MediaPipe detector.close()
+        # 都不会执行 → 摄像头句柄泄漏，连续启停时可能打不开摄像头。
+        # 现改为调用正式的 stop()，但整体放进后台线程并限时等待：
+        # 既完成释放，又不会因某个资源释放卡住而让退出界面"未响应"。
+        stop_thread = None
+        try:
+            if self.motion is not None and hasattr(self.motion, 'stop'):
+                stop_thread = threading.Thread(
+                    target=self._safe_stop_motion,
+                    name="motion-stop",
+                    daemon=True
+                )
+                stop_thread.start()
+                # 不在此处等待：让释放与下面的保存/关闭动作并行，
+                # 最后统一收尾等待，避免串行拖长退出时间。
+        except Exception as e:  # noqa: BLE001
+            print(f"[退出] 启动动作捕捉释放线程失败: {type(e).__name__}: {e}")
+
+        # 保存学习数据：改为非守护线程 + 限时等待。
+        # 原为 daemon=True 且不 join，进程随时可能在写文件写到一半时被杀，
+        # 留下截断/损坏的 JSON，下次启动读取时崩溃（P0-⑤）。
+        try:
+            if hasattr(self.motion, 'save_wave_learning_data'):
+                save_thread = threading.Thread(
+                    target=self._safe_save_learning_data,
+                    name="save-learning-data"
+                )  # 非 daemon：确保即使主流程结束也能写完
+                save_thread.start()
+                save_thread.join(timeout=3.0)
+                if save_thread.is_alive():
+                    print("[P1+P2] 学习数据保存超时（3s），可能未写完")
+                else:
+                    print("[P1+P2] 学习数据已保存")
+        except Exception as e:  # noqa: BLE001
+            print(f"[退出] 保存学习数据异常: {type(e).__name__}: {e}")
+
         try:
             if self.voice_trigger is not None:
                 self.voice_trigger.stop_listening()
-        except Exception as e:
+        except (RuntimeError, AttributeError) as e:
             print(f"关闭语音触发异常: {e}")
+
         try:
             self.player.stop()
-        except Exception as e:
+        except (RuntimeError, AttributeError) as e:
             print(f"关闭播放器异常: {e}")
+
+        # 统一等待动作捕捉资源释放（最多 2 秒）。
+        # 超时通常意味着 MediaPipe/OpenCV 的原生释放卡住——不做无谓等待，
+        # 交给 main() 末尾的强制退出处理（进程结束由 OS 回收句柄）。
+        if stop_thread is not None:
+            stop_thread.join(timeout=2.0)
+            if stop_thread.is_alive():
+                print("[退出] 动作捕捉资源释放超时（2s），将强制结束进程")
+
         pygame.quit()
         print("SoulPlayer 已安全退出。")
 
 
+# ==================== 单实例 ====================
+# 摄像头是独占资源：双击两次会开两个进程，第二个抢不到设备，
+# 用户看到的就是"黑屏"，还以为是程序坏了。
+_MUTEX_HANDLE = None
+# pygame 2 在 Windows 上注册的窗口类名实测是 "pygame"（SDL_app 是 SDL1 的），
+# 兼容两个名字；标题会随播放曲目变化，不能作为唯一依据。
+_WINDOW_CLASSES = ("pygame", "SDL_app")
+
+
+def _acquire_single_instance() -> bool:
+    """
+    Windows 命名互斥体。True 表示本进程是唯一实例。
+    SOULPLAYER_ALLOW_MULTI=1 可关闭该限制（自动化测试用）。
+    """
+    global _MUTEX_HANDLE
+    if os.name != "nt" or os.environ.get("SOULPLAYER_ALLOW_MULTI") == "1":
+        return True
+    try:
+        import ctypes
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateMutexW.restype = ctypes.c_void_p
+        _MUTEX_HANDLE = kernel32.CreateMutexW(
+            None, False, "Local\\SoulPlayer.SingleInstance")
+        # ERROR_ALREADY_EXISTS = 183
+        return ctypes.get_last_error() != 183
+    except Exception as e:  # noqa: BLE001
+        print(f"[启动] 单实例检测不可用（继续启动）: {e}")
+        return True
+
+
+def _focus_existing_window() -> bool:
+    """
+    把已经在跑的窗口拉到前台，让"第二次双击"表现为唤回而不是没反应。
+    按 SDL 窗口类名查找，不依赖标题（标题会随播放曲目变化）。
+    """
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        found = []
+
+        @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        def _enum(hwnd, _lparam):
+            try:
+                cls = ctypes.create_unicode_buffer(64)
+                user32.GetClassNameW(hwnd, cls, 64)
+                if not user32.IsWindowVisible(hwnd):
+                    return True
+                title = ctypes.create_unicode_buffer(256)
+                user32.GetWindowTextW(hwnd, title, 256)
+                is_ours = (cls.value in _WINDOW_CLASSES
+                           or "SoulPlayer" in title.value)
+                if not is_ours:
+                    return True
+                # 标题含 SoulPlayer 的优先（避免误中其他 pygame 程序）
+                found.append((0 if "SoulPlayer" in title.value else 1, hwnd))
+            except Exception:
+                pass
+            return True
+
+        user32.EnumWindows(_enum, 0)
+        if not found:
+            return False
+        found.sort(key=lambda item: item[0])
+        hwnd = found[0][1]
+        user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+        user32.SetForegroundWindow(hwnd)
+        return True
+    except Exception as e:  # noqa: BLE001
+        print(f"[启动] 唤回已有窗口失败: {e}")
+        return False
+
+
 def main():
     """程序入口"""
+    if not _acquire_single_instance():
+        print("[启动] 已有一个 SoulPlayer 在运行，唤回它的窗口。")
+        _focus_existing_window()
+        return
+
     try:
         app = SoulPlayerApp()
         app.run()
@@ -3650,7 +4103,17 @@ def main():
         print("\n用户中断，程序退出。")
     except Exception as e:
         print(f"主程序异常: {e}")
-        raise
+        traceback.print_exc()
+        # 异常路径同样强制结束：残留的原生线程否则会让进程关不掉
+        sys.stdout.flush()
+        os._exit(1)
+
+    # 【P0-⑤】正常退出路径：MediaPipe / OpenCV 的原生线程偶尔不会自行结束，
+    # 解释器会在退出阶段长时间挂住（表现为"点了关闭却关不掉"，实测可卡住 30s+）。
+    # 所有必要清理（学习数据保存、摄像头/detector 释放、pygame.quit）都已在
+    # _cleanup 中完成，这里直接结束进程，保证一定能退出。
+    sys.stdout.flush()
+    os._exit(0)
 
 
 if __name__ == "__main__":

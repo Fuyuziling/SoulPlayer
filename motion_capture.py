@@ -24,6 +24,10 @@ import time
 from collections import deque
 from typing import Optional, List, Dict, Any
 
+# 导入挥手动作学习系统
+from wave_learning import WaveLearningManager, create_wave_learning_manager
+from wave_learning_rules import validate_and_filter_trigger
+
 
 # ──────────────────────── 关键点索引常量 ────────────────────────
 # MediaPipe Pose 关键点编号（33 点）
@@ -128,8 +132,10 @@ class MotionCapture:
         self._timestamp_ms = 0
         self.detector = None
         self.hand_detector = None  # HandLandmarker（每只手 21 点，精细手型识别）
+        self.face_detector = None  # FaceLandmarker（面部 478 点，表情/头部姿态）
         self._temp_model_path: Optional[str] = None  # 临时复制的模型路径，需在 stop 时清理
         self._temp_hand_model_path: Optional[str] = None  # 手部模型临时 ASCII 路径
+        self._temp_face_model_path: Optional[str] = None  # 面部模型临时 ASCII 路径
 
         # 优先尝试新 API (MediaPipe 0.10.30+ Tasks API)
         try:
@@ -225,6 +231,40 @@ class MotionCapture:
                 except Exception as _he:
                     self.hand_detector = None
                     print(f"[MotionCapture] 手部检测器加载失败，手型识别不可用: {_he}")
+
+                # ── 面部检测器（FaceLandmarker，478 点，表情/头部姿态识别） ──
+                # 面部模型可选：加载失败仅降级（面部识别不可用，不影响 Pose 主流程）
+                try:
+                    _face_project = os.path.join(_script_dir, 'face_landmarker.task')
+                    _face_ascii = os.path.join(tempfile.gettempdir(), 'face_landmarker.task')
+                    _face_path = None
+                    for _cand in (_face_ascii, _face_project):
+                        if os.path.exists(_cand):
+                            _face_path = _cand
+                            break
+                    if _face_path is None:
+                        print("[MotionCapture] 面部模型 face_landmarker.task 未找到，面部识别不可用")
+                    else:
+                        if not all(ord(c) < 128 for c in _face_path):
+                            import shutil
+                            shutil.copy2(_face_path, _face_ascii)
+                            _face_path = _face_ascii
+                            self._temp_face_model_path = _face_ascii
+                        _face_base = python.BaseOptions(model_asset_path=_face_path)
+                        _face_options = vision.FaceLandmarkerOptions(
+                            base_options=_face_base,
+                            running_mode=vision.RunningMode.VIDEO,
+                            num_faces=1,
+                            min_face_detection_confidence=0.5,
+                            min_face_presence_confidence=0.5,
+                            min_tracking_confidence=0.5,
+                            output_face_blendshapes=True,
+                        )
+                        self.face_detector = vision.FaceLandmarker.create_from_options(_face_options)
+                        print("[MotionCapture] 面部检测器已加载 (FaceLandmarker 478 点)")
+                except Exception as _fe:
+                    self.face_detector = None
+                    print(f"[MotionCapture] 面部检测器加载失败，面部识别不可用: {_fe}")
         except Exception as e:
             # 新 API 加载失败，尝试旧 API 或降级到模拟模式
             print(f"[MotionCapture] 新 API 加载失败 ({e})，尝试旧 API...")
@@ -285,9 +325,23 @@ class MotionCapture:
             'L': deque(maxlen=20),
             'R': deque(maxlen=20),
         }
-        # 挥手方向（原始图像坐标）：+1 = 原始x增大（显像框中从右向左划），
-        # -1 = 原始x减小（显像框中从左向右划），0 = 无有效挥手
+        # 挥手方向（用户视角，用户明确要求）：+1 = 向左挥手（下一首），
+        # -1 = 向右挥手（上一首），0 = 无有效挥手。注意：MediaPipe 在原始
+        # 图像坐标上推理，原始 x 增大的画面经镜像显示后是"手向左"（用户
+        # 向左挥手）→ +1；原始 x 减小 → 用户向右挥手 → -1。
+        # 方向：事件级锁存。挥手事件起点锁存"窗口内首段显著位移"方向
+        #（挥出方向），事件期间恒定输出——回程/窗口滑动不改写方向，
+        # 配合 PresetEngine 的 _wave_event_fired 锁存保证"一次挥手事件
+        # 只触发一次切歌、同一方向恒触发同一首"（修复同向挥手串触发）。
+        # 事件状态：_wave_event_active 事件进行中；_wave_event_dir 锁定方向；
+        # _wave_still_frames 手臂连续静止帧计数（事件结束判定）。
         self._wave_direction: float = 0.0
+        self._wave_event_active: bool = False
+        self._wave_event_dir: float = 0.0
+        self._wave_still_frames: int = 0
+        # 视觉特征数据（用于白名单学习和数据库记录）
+        self._latest_wave_x_span: float = 0.0
+        self._latest_wave_ang_span: float = 0.0
         # 身体速度历史，用于自适应归一化
         self._speed_history: deque = deque(maxlen=30)
 
@@ -300,6 +354,53 @@ class MotionCapture:
 
         # ── 调试标志 ──
         self._debug = False
+
+        # ── 挥手动作学习系统（P1+P2） ──
+        # 解决单手模式下某个方向触发率低的问题
+        self._wave_learning_enabled = True
+        self._wave_learning_manager: Optional[WaveLearningManager] = None
+        self._visual_whitelist = None  # 视觉特征白名单
+        self._init_wave_learning()
+
+    # ═══════════════════════════════════════════════════════
+    # 挥手动作学习系统
+    # ═══════════════════════════════════════════════════════
+
+    def _init_wave_learning(self):
+        """初始化挥手动作学习系统"""
+        if not self._wave_learning_enabled:
+            print("[MotionCapture] 学习系统未启用（_wave_learning_enabled=False）")
+            return
+
+        try:
+            # 数据目录：与预设/日志同根（由 app_paths 决定开发态/便携/安装版）。
+            # 旧版写在 ~/.soulplayer/learning_data，首次运行自动迁移。
+            try:
+                import app_paths
+                data_dir = str(app_paths.migrate_legacy_home_data("learning_data"))
+            except Exception:
+                data_dir = os.path.join(os.path.expanduser('~'), '.soulplayer', 'learning_data')
+            self._wave_learning_manager = create_wave_learning_manager({
+                "data_dir": data_dir,
+                "enable_p1": True,
+                "enable_p2": True
+            })
+            # 始终输出学习系统状态（不依赖 _debug 标志）
+            print("[MotionCapture] 挥手动作学习系统已启用（P1+P2）")
+            if self._debug:
+                print(f"[学习系统] 数据目录: {data_dir}")
+                print(f"[学习系统] P1 自适应阈值: 启用")
+                print(f"[学习系统] P2 幅度归一化: 启用")
+
+            # 初始化视觉特征白名单
+            from wave_learning_rules import get_visual_whitelist
+            self._visual_whitelist = get_visual_whitelist()
+            print("[MotionCapture] 视觉特征白名单已启用")
+        except Exception as e:
+            print(f"[MotionCapture] 挥手学习系统初始化失败: {e}")
+            import traceback
+            traceback.print_exc()
+            self._wave_learning_enabled = False
 
     # ═══════════════════════════════════════════════════════
     # 公共接口
@@ -420,6 +521,32 @@ class MotionCapture:
             t += 0.033
             time.sleep(0.033)  # 约 30 FPS
 
+    @staticmethod
+    def _close_detector(detector, name: str, timeout: float = 0.5) -> None:
+        """
+        带超时地关闭 MediaPipe detector。
+
+        断网/网络受限环境下，MediaPipe 关闭时会触发 telemetry（clearcut）
+        上报，连接失败要重试很久——实测每个 detector.close() 都会阻塞 25 秒以上，
+        三个 detector 累计 75 秒，直接导致"点了关闭却关不掉"。
+        这里改为后台线程限时关闭：正常网络下瞬间完成，异常时到点即放弃
+        （进程退出后由操作系统回收，不会有实际影响）。
+        """
+        if detector is None:
+            return
+
+        def _do_close():
+            try:
+                detector.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+        th = threading.Thread(target=_do_close, name=f"close-{name}", daemon=True)
+        th.start()
+        th.join(timeout)
+        if th.is_alive():
+            print(f"[MotionCapture] {name} detector 关闭超时（{timeout}s），放弃等待")
+
     def stop(self) -> None:
         """
         停止摄像头和推理线程，释放资源。
@@ -434,27 +561,23 @@ class MotionCapture:
             self._cap.release()
             self._cap = None
 
-        # 释放 detector 资源
+        # 释放 detector 资源（全部走带超时的关闭，见 _close_detector 说明）
         if self._use_tasks_api and self.detector is not None:
-            try:
-                self.detector.close()
-            except Exception:
-                pass
+            self._close_detector(self.detector, "pose")
 
         # 释放手部检测器资源
         if self._use_tasks_api and self.hand_detector is not None:
-            try:
-                self.hand_detector.close()
-            except Exception:
-                pass
+            self._close_detector(self.hand_detector, "hand")
             self.hand_detector = None
+
+        # 释放面部检测器资源
+        if self._use_tasks_api and self.face_detector is not None:
+            self._close_detector(self.face_detector, "face")
+            self.face_detector = None
 
         # 释放旧 API Pose 资源
         if not self._use_tasks_api and hasattr(self, 'pose') and self.pose is not None:
-            try:
-                self.pose.close()
-            except Exception:
-                pass
+            self._close_detector(self.pose, "legacy-pose")
 
         # 重置历史数据
         self._prev_landmarks = None
@@ -469,6 +592,11 @@ class MotionCapture:
         for _h in self._elbow_xy_history.values():
             _h.clear()
         self._speed_history.clear()
+        # 重置挥手方向与事件状态（防止下次 start 携带旧方向/旧事件）
+        self._wave_direction = 0.0
+        self._wave_event_active = False
+        self._wave_event_dir = 0.0
+        self._wave_still_frames = 0
 
         with self._lock:
             self._latest_features = self._get_default_features()
@@ -483,6 +611,16 @@ class MotionCapture:
             except Exception:
                 pass
             self._temp_model_path = None
+
+        # 清理临时复制的面部模型文件
+        if self._temp_face_model_path is not None:
+            try:
+                if os.path.exists(self._temp_face_model_path):
+                    os.remove(self._temp_face_model_path)
+                    print(f"[MotionCapture] 已清理临时面部模型文件: {self._temp_face_model_path}")
+            except Exception:
+                pass
+            self._temp_face_model_path = None
 
     @property
     def is_running(self) -> bool:
@@ -522,6 +660,140 @@ class MotionCapture:
             if self._latest_frame is None:
                 return None
             return self._latest_frame.copy()
+
+    # ═══════════════════════════════════════════════════════
+    # 挥手动作学习系统接口
+    # ═══════════════════════════════════════════════════════
+
+    def get_wave_learning_threshold(self, hand: str, direction: float):
+        """获取挥手触发阈值（供gesture_presets.py查询）
+
+        Args:
+            hand: 手别 'L' 或 'R'
+            direction: 方向 +1.0 或 -1.0
+
+        Returns:
+            (x_threshold, ang_threshold) - 触发阈值
+        """
+        if self._wave_learning_enabled and self._wave_learning_manager is not None:
+            x_th, ang_th, _ = self._wave_learning_manager.get_threshold(hand, direction)
+            return x_th, ang_th
+        return 0.06, 0.20  # 默认值
+
+    def get_wave_learning_summary(self) -> Dict:
+        """获取学习摘要（用于UI显示/调试）
+
+        Returns:
+            学习统计摘要字典
+        """
+        if self._wave_learning_enabled and self._wave_learning_manager is not None:
+            return self._wave_learning_manager.get_learning_summary()
+        return {}
+
+    def record_wave_result(self, hand: str, direction: float, triggered: bool,
+                          confidence: float = 1.0, action: str = "",
+                          wave_direction: float = 0.0,
+                          arm_motion: float = 0.0,
+                          x_span: float = 0.0,
+                          ang_span: float = 0.0):
+        """记录挥手触发结果（供gesture_presets.py调用）
+
+        Args:
+            hand: 手别 'L' 或 'R'
+            direction: 方向 +1.0 或 -1.0
+            triggered: 是否成功触发动作
+            confidence: 触发置信度（0~1），低置信度的触发可能被当作"失败"处理
+            action: 触发的动作名称（如 'player_next', 'player_prev'），用于白名单验证
+            wave_direction: 实际检测到的方向幅度（用于视觉特征白名单）
+            arm_motion: 手臂横向运动幅度（用于视觉特征白名单）
+            x_span: x方向跨度（可选，用于视觉特征白名单）
+            ang_span: 角度跨度（可选，用于视觉特征白名单）
+        """
+        if self._wave_learning_enabled and self._wave_learning_manager is not None:
+            # ── 第1层：方向白名单验证（优先级最高） ──
+            from wave_learning_rules import is_legal_trigger
+            if action and not is_legal_trigger(hand, direction, action):
+                # 不在白名单中：不记录到学习系统
+                action_cn = "下一首" if direction > 0 else "上一首"
+                print(f"\n{'='*60}")
+                print(f"[白名单过滤] ⚠️ 检测到非法触发！")
+                print(f"  方向: {'向左' if direction > 0 else '向右'} ({direction:+.1f})")
+                print(f"  动作: {action}")
+                print(f"  预期: {'下一首 (player_next)' if direction > 0 else '上一首 (player_prev)'}")
+                print(f"  结果: 已拦截，不记录到学习系统")
+                print(f"{'='*60}\n")
+                return
+
+            # ── 第2层：置信度过滤 ──
+            effective_triggered = triggered and confidence >= 0.5
+
+            # ── 第3层：视觉特征白名单验证（增强） ──
+            if self._visual_whitelist is not None and action:
+                from wave_learning_rules import validate_trigger_with_visual_features
+                is_valid, reason = validate_trigger_with_visual_features(
+                    hand=hand,
+                    direction=direction,
+                    triggered_action=action,
+                    confidence=confidence,
+                    wave_direction=wave_direction,
+                    arm_motion=arm_motion,
+                    x_span=x_span,
+                    ang_span=ang_span,
+                    visual_whitelist=self._visual_whitelist
+                )
+                if not is_valid:
+                    print(f"\n{'='*60}")
+                    print(f"[视觉特征白名单过滤] ⚠️ {reason}")
+                    print(f"  手别: {hand}手")
+                    print(f"  方向: {'向左' if direction > 0 else '向右'} ({direction:+.1f})")
+                    print(f"  动作: {action}")
+                    print(f"  视觉特征: wave_dir={wave_direction:.2f}, arm_motion={arm_motion:.2f}")
+                    if x_span > 0:
+                        print(f"            x_span={x_span:.3f}")
+                    if ang_span > 0:
+                        print(f"            ang_span={ang_span:.1f}°")
+                    print(f"{'='*60}\n")
+                    return
+
+            # ── 传递给P1（记录触发结果） ──
+            self._wave_learning_manager.record_wave_attempt(
+                hand=hand,
+                direction=direction,
+                x_span=x_span,  # 传递实际幅度数据
+                y_span=0.0,
+                ang_span=ang_span,
+                triggered=effective_triggered,
+                confidence=confidence if effective_triggered else 0.0
+            )
+
+            # ── 记录视觉特征数据到数据库（用于学习） ──
+            self._wave_learning_manager.record_visual_features(
+                hand=hand,
+                direction=direction,
+                wave_direction=wave_direction,
+                arm_motion=arm_motion,
+                x_span=x_span,
+                ang_span=ang_span,
+                triggered=effective_triggered
+            )
+
+            # ── 调试输出 ──
+            if self._debug:
+                action_str = "下一首" if direction > 0 else "上一首"
+                if effective_triggered:
+                    print(f"[学习记录OK] {hand}手向{'左' if direction > 0 else '右'} -> {action} (置信度={confidence:.2f})")
+                elif confidence < 0.5:
+                    print(f"[置信度过滤] {hand}手向{'左' if direction > 0 else '右'} -> {action} (置信度={confidence:.2f}<0.5)")
+
+    def save_wave_learning_data(self):
+        """保存学习数据（供程序退出时调用）"""
+        if self._wave_learning_enabled and self._wave_learning_manager is not None:
+            self._wave_learning_manager.save()
+
+    def reset_wave_learning(self):
+        """重置学习数据（调试用）"""
+        if self._wave_learning_enabled and self._wave_learning_manager is not None:
+            self._wave_learning_manager.reset()
 
     # ═══════════════════════════════════════════════════════
     # 内部推理循环
@@ -571,6 +843,11 @@ class MotionCapture:
                     _hands = self._detect_hands(mp_image)
                     features['hand_landmarks'] = [h['points'] for h in _hands]
                     features.update(self._extract_hand_features(_hands))
+
+                    # ── 面部检测（FaceLandmarker 478 点，表情/头部姿态） ──
+                    # 在原始帧上推理（与 Pose 同一坐标系），记录 478 点与表情分数
+                    _faces = self._detect_faces(mp_image)
+                    features.update(self._extract_face_features(_faces))
                 else:
                     # ── 旧 API (MediaPipe 0.9.x) ──
                     rgb_frame = cv2.cvtColor(raw_frame, cv2.COLOR_BGR2RGB)
@@ -579,6 +856,7 @@ class MotionCapture:
                     features = self._extract_features(results, current_time)
                     features['hand_landmarks'] = []
                     features.update(self._extract_hand_features([]))
+                    features.update(self._extract_face_features([]))
 
                 # ── 更新缓存（加锁） ──
                 # features 中的 landmarks 基于原始图像坐标
@@ -622,7 +900,7 @@ class MotionCapture:
                             'z': float(getattr(lm, 'z', 0.0)),
                             'visibility': 1.0,
                         })
-                    # 左右手：优先用 handedness 分类名，取不到时按腕部 x（左小右大）
+                    # 左右手：优先用 handedness 分类名
                     side = 'R'
                     try:
                         if handedness and i < len(handedness) and handedness[i]:
@@ -630,17 +908,49 @@ class MotionCapture:
                             side = 'L' if 'Left' in _name else 'R'
                     except Exception:
                         pass
-                    if side == 'R' and pts:
-                        _wrist_x = pts[0]['x']
-                        for _h in hands:
-                            if _h['side'] == 'L':
-                                side = 'L'
-                                break
                     hands.append({'side': side, 'points': pts})
             return hands
         except Exception as _he:
             if self._debug:
                 print(f"[MotionCapture] 手部检测异常: {_he}")
+            return []
+
+    def _detect_faces(self, mp_image) -> list:
+        """
+        对原始帧运行 FaceLandmarker，返回面部 478 点列表（含表情 blendshape 分数）。
+
+        Returns:
+            list: 每张脸一个 dict：{'points': [478 点 dict], 'blendshapes': {名称: 分数}}。
+                  未加载面部模型或无脸时返回空列表。
+        """
+        if self.face_detector is None:
+            return []
+        try:
+            result = self.face_detector.detect_for_video(mp_image, self._timestamp_ms)
+            faces = []
+            if result.face_landmarks:
+                blends = getattr(result, 'face_blendshapes', None)
+                for i, flm in enumerate(result.face_landmarks):
+                    pts = []
+                    for lm in flm:
+                        pts.append({
+                            'x': float(lm.x),
+                            'y': float(lm.y),
+                            'z': float(getattr(lm, 'z', 0.0)),
+                            'visibility': 1.0,
+                        })
+                    bs = {}
+                    try:
+                        if blends and i < len(blends) and blends[i]:
+                            for cat in blends[i]:
+                                bs[cat.category_name] = float(cat.score)
+                    except Exception:
+                        pass
+                    faces.append({'points': pts, 'blendshapes': bs})
+            return faces
+        except Exception as _fe:
+            if self._debug:
+                print(f"[MotionCapture] 面部检测异常: {_fe}")
             return []
 
     # 手指关节索引（HandLandmarker 21 点）：腕 0 / 拇指 1-4 / 食指 5-8 / 中指 9-12 / 无名指 13-16 / 小指 17-20
@@ -690,6 +1000,104 @@ class MotionCapture:
                      for name in ('thumb', 'index', 'middle', 'ring', 'pinky')]
             feats[f'finger_curls_{side}'] = curls
             feats[f'hand_gesture_{side}'] = self._classify_hand_gesture(pts, curls)
+        return feats
+
+    def _extract_shoulder_features(self, landmarks: np.ndarray) -> Dict[str, Any]:
+        """
+        从 Pose 33 点中提取肩部特征（与手部 21 点同样按"独立部位"方式暴露）：
+        - shoulder_landmarks_L/R：左右肩（11/12）原始坐标（供 UI 绘制/姿态参考）
+        - shoulder_mid_x/y：肩中点（归一化坐标）
+        - shoulder_width：肩宽（左右肩归一化距离，体型尺度参考）
+        - shoulder_tilt：肩部侧倾角（左右肩连线相对水平线的角度，度）
+        """
+        feats: Dict[str, Any] = {
+            'shoulder_landmarks_L': None,
+            'shoulder_landmarks_R': None,
+            'shoulder_mid_x': None,
+            'shoulder_mid_y': None,
+            'shoulder_width': None,
+            'shoulder_tilt': None,
+        }
+        if landmarks is None or landmarks.shape[0] < 13:
+            return feats
+        ls = landmarks[LEFT_SHOULDER]
+        rs = landmarks[RIGHT_SHOULDER]
+        if ls[3] <= 0.3 or rs[3] <= 0.3:
+            return feats
+        feats['shoulder_landmarks_L'] = {
+            'x': float(ls[0]), 'y': float(ls[1]),
+            'z': float(ls[2]), 'visibility': float(ls[3]),
+        }
+        feats['shoulder_landmarks_R'] = {
+            'x': float(rs[0]), 'y': float(rs[1]),
+            'z': float(rs[2]), 'visibility': float(rs[3]),
+        }
+        feats['shoulder_mid_x'] = float((ls[0] + rs[0]) / 2.0)
+        feats['shoulder_mid_y'] = float((ls[1] + rs[1]) / 2.0)
+        feats['shoulder_width'] = float(np.hypot(rs[0] - ls[0], rs[1] - ls[1]))
+        dx = rs[0] - ls[0]
+        dy = rs[1] - ls[1]
+        if abs(dx) > 1e-6:
+            feats['shoulder_tilt'] = float(np.degrees(np.arctan2(dy, dx)))
+        return feats
+
+    def _extract_face_features(self, faces: list) -> Dict[str, Any]:
+        """
+        从面部 478 点 + blendshape 表情分数计算精细特征：
+        - face_landmarks：第一张脸的 478 点原始坐标（供 UI 绘制）
+        - face_present：是否检测到人脸
+        - face_mouth_open：张嘴程度 0~1（blendshape jawOpen，缺失时用上下唇几何比）
+        - face_smile：微笑程度 0~1（blendshape mouthSmile，缺失时用嘴角几何抬升）
+        - face_head_tilt：头部侧倾角（左右眼外角连线相对水平线的角度，度）
+        """
+        feats: Dict[str, Any] = {
+            'face_landmarks': [],
+            'face_present': False,
+            'face_mouth_open': None,
+            'face_smile': None,
+            'face_head_tilt': None,
+        }
+        if not faces:
+            return feats
+        face = faces[0]
+        pts = face.get('points', [])
+        if len(pts) < 468:
+            return feats
+        feats['face_landmarks'] = pts
+        feats['face_present'] = True
+        bs = face.get('blendshapes') or {}
+
+        def _d(a, b):
+            return ((pts[a]['x'] - pts[b]['x']) ** 2
+                    + (pts[a]['y'] - pts[b]['y']) ** 2) ** 0.5
+
+        # ── 张嘴：优先 blendshape jawOpen，缺失回退几何（上下唇 13/14 间距 / 眼距 33/263） ──
+        jaw = bs.get('jawOpen')
+        if jaw is not None:
+            feats['face_mouth_open'] = max(0.0, min(1.0, jaw))
+        else:
+            eye_d = _d(33, 263)
+            lip_d = _d(13, 14)
+            if eye_d > 1e-6:
+                feats['face_mouth_open'] = max(0.0, min(1.0, lip_d / eye_d * 2.0))
+
+        # ── 微笑：优先 blendshape mouthSmile，缺失回退嘴角（61/291）相对鼻尖(1)的抬升 ──
+        smile = max(bs.get('mouthSmileLeft', 0.0), bs.get('mouthSmileRight', 0.0))
+        if smile > 0.0:
+            feats['face_smile'] = max(0.0, min(1.0, smile))
+        else:
+            nose_y = pts[1]['y']
+            corner_y = (pts[61]['y'] + pts[291]['y']) / 2.0
+            eye_d = _d(33, 263)
+            if eye_d > 1e-6:
+                lift = (nose_y - corner_y) / eye_d
+                feats['face_smile'] = max(0.0, min(1.0, lift * 2.0 + 0.5))
+
+        # ── 头部侧倾角：左右眼外角连线与水平线的夹角（度） ──
+        dx = pts[263]['x'] - pts[33]['x']
+        dy = pts[263]['y'] - pts[33]['y']
+        if abs(dx) > 1e-6:
+            feats['face_head_tilt'] = float(np.degrees(np.arctan2(dy, dx)))
         return feats
 
     def _classify_hand_gesture(self, pts: list, curls: list) -> str:
@@ -820,8 +1228,12 @@ class MotionCapture:
             # 肘部运动轨迹（当前窗口），供 DTW 模板匹配使用：
             # 取左右肘部历史中横向跨度较大的一侧，作为"当前动作轨迹快照"
             'arm_trajectory': self._current_arm_trajectory(),
+            # 视觉特征白名单增强数据（从 _calc_arm_horizontal_motion 获取）
+            'wave_x_span': self._latest_wave_x_span,
+            'wave_ang_span': self._latest_wave_ang_span,
         }
         features.update(pose_config)  # pose_elbow_angle_*/pose_wrist_*/pose_spread_*
+        features.update(self._extract_shoulder_features(landmarks))
         return features
 
     def _current_arm_trajectory(self) -> list:
@@ -1048,6 +1460,10 @@ class MotionCapture:
         Returns:
             挥手强度 [0, 1]，跨越大半个屏幕时接近 1.0。
         """
+        # 重置本次计算的视觉特征数据
+        self._latest_wave_x_span = 0.0
+        self._latest_wave_ang_span = 0.0
+
         VIS_THRESHOLD = 0.3       # 肘部可见性阈值（作为整条手臂的存在判据）
         WAVE_X_THRESHOLD = 0.06   # 横向跨度阈值：6% 屏幕宽度（参考：挥手位移约占屏宽
                                   # 15~30%，肘部为支点约折半即 7.5~15%；6% 贴近下限
@@ -1074,19 +1490,21 @@ class MotionCapture:
                                   # 留足余量，挥手手略抬起亦不误杀）。
                                   # 与 palm_hover 的"腕部在肩上方=举手"互斥一致：
                                   # 举手/悬停腕部更高，同样被此门排除。
-        MAX_Y_X_RATIO = 2.0       # 纵向跨度上限：不得超过横向跨度的 200%
+        MAX_Y_X_RATIO = 1.5       # 纵向跨度上限：不得超过横向跨度的 150%
                                   #（允许明显斜向/弧线挥手——实机挥手肘部绕肩
                                   #  弧线运动，纵向分量常达横向的 1.2~1.6 倍，
-                                  #  旧值 1.6 恰好卡在参考上限上，弧线稍大即被
-                                  #  排除导致难触发；放宽到 2.0 留足余量。
-                                  #  y/x>2.0 的纯纵向手势（上下摆手/锤桌）仍排除，
-                                  #  且 y 翻转主导规则继续兜底）
+                                  #  1.5 留足余量但排除纯纵向/大幅弧线动作。
+                                  #  旧值 2.0 过宽：用户日志显示大量"跨 y 明显
+                                  #  大于跨 x"的动作（走路摆臂/身体调整）被
+                                  #  误判为挥手切歌，收紧到 1.5 后这些帧的
+                                  #  y/x（1.5~1.8）被排除，真实挥手仍放行）
         MIN_DIR_FLIPS = 1         # 最少横向方向翻转次数：≥1 即有"去-回"往返迹象，
-                                  #（指向/摊手/伸臂等单程位移为 0 次翻转被排除；
-                                  #  举手/挠头/上下摆手由肘部高度门与纵向比排除，
-                                  #  此处不要求 ≥2 以免卡掉 1Hz 慢速挥手——
-                                  #  慢挥手一个完整"去-回"仅 1 次翻转；
-                                  #  追踪点已改肘部，手指动作完全不参与位移）
+                                  #（指向/摊手/伸臂等单程位移为 0 次翻转被排除。
+                                  #  真实挥手一次"去-回"（0.33~0.67s，20 帧窗口
+                                  #  恰好覆盖）仅 1 次翻转，要求 ≥2 会卡掉正常
+                                  #  挥手导致"基本触发不灵敏"；慢速摆臂/身体
+                                  #  调整等误触由 MAX_Y_X_RATIO 纵向主导排除
+                                  #  与肘部/腕部高度门承担，不再靠翻转次数）
         FLIP_DEADBAND = 0.01      # 翻转计数死区（归一化坐标）：单步位移绝对值小于此
                                   # 值不视为方向变化（MediaPipe 静止抖动约 0.001，
                                   # 臂部运动估计噪声通常 <0.01）。防止纵向估计噪声
@@ -1184,6 +1602,9 @@ class MotionCapture:
             self._elbow_xy_history['L'].clear()
             self._elbow_xy_history['R'].clear()
             self._wave_direction = 0.0
+            self._wave_event_active = False
+            self._wave_event_dir = 0.0
+            self._wave_still_frames = 0
             return 0.0
 
         # 肘部坐标入挥手队列；同时记录腕部坐标供举手悬停判定
@@ -1304,6 +1725,9 @@ class MotionCapture:
             # 是紧跟其后的反向横扫，若用"相对起点偏移最大的点"定向，
             # 回程偏移最大会把方向带反（"收手时最容易串成反向"根因）。
             # 只认首段方向：单程挥、往返挥都正确；回程不覆盖方向。
+            # 符号约定（用户视角，用户明确要求）：向右挥手 = -1（上一首），
+            # 向左挥手 = +1（下一首）。原始图像坐标 x 增大经镜像显示后是
+            # "手向左"（用户向左挥手）→ +1；x 减小 → 用户向右挥手 → -1。
             first_dir = 0.0
             for i in range(1, len(xs)):
                 d = xs[i] - xs[i - 1]
@@ -1314,21 +1738,65 @@ class MotionCapture:
                 best_span = x_span
                 best_dir = first_dir
 
-        self._wave_direction = best_dir
+        # 事件激活和方向锁定（在循环外，只执行一次）
+        if best_span > 0.0 and not self._wave_event_active:
+            # 首次检测到有效挥手：激活事件并锁定方向
+            self._wave_event_active = True
+            self._wave_event_dir = best_dir
 
-        # 调试输出：每 0.5 秒打印一次真实追踪数据（校准用）
-        now = time.time()
-        if dbg and now - getattr(self, '_dbg_wave_t', 0.0) > 0.5:
-            self._dbg_wave_t = now
-            ev = landmarks[RIGHT_ELBOW, 3]
-            wv = landmarks[RIGHT_WRIST, 3]
-            trig = f" → 挥手! 方向{best_dir:+.0f}" if best_span > 0 else ""
-            print(f"[挥手调试] {' '.join(dbg)} 阈值={WAVE_X_THRESHOLD} "
-                  f"右肘vis={ev:.2f} 右腕vis={wv:.2f}{trig}")
+            # 保存当前最佳挥手的幅度数据（用于视觉特征白名单）
+            # 需要在循环内部保存 best_x_span 和 best_ang_span
+            # 这里简化处理：从历史队列计算
+            for side in ('L', 'R'):
+                vals = list(self._elbow_xy_history[side])
+                if len(vals) >= 2:
+                    xs = [p[0] for p in vals]
+                    ys = [p[1] for p in vals]
+                    self._latest_wave_x_span = max(xs) - min(xs)
+                    # 计算角度跨度
+                    sh = LEFT_SHOULDER if side == 'L' else RIGHT_SHOULDER
+                    el = LEFT_ELBOW if side == 'L' else RIGHT_ELBOW
+                    if landmarks is not None and landmarks.shape[0] > max(sh, el):
+                        shoulder_vec = np.array([landmarks[sh, 0], landmarks[sh, 1]])
+                        elbow_vec = np.array([landmarks[el, 0], landmarks[el, 1]])
+                        arm_vec = elbow_vec - shoulder_vec
+                        if np.linalg.norm(arm_vec) > 1e-6:
+                            angles = [float(np.arctan2(p[1] - shoulder_vec[1], p[0] - shoulder_vec[0])) for p in vals if len(p) >= 2]
+                            if len(angles) >= 2:
+                                angles_unwrapped = []
+                                for i, ang in enumerate(angles):
+                                    if i == 0:
+                                        angles_unwrapped.append(ang)
+                                    else:
+                                        while ang - angles_unwrapped[-1] > np.pi:
+                                            ang -= 2.0 * np.pi
+                                        while ang - angles_unwrapped[-1] < -np.pi:
+                                            ang += 2.0 * np.pi
+                                        angles_unwrapped.append(ang)
+                                if len(angles_unwrapped) >= 2:
+                                    self._latest_wave_ang_span = max(angles_unwrapped) - min(angles_unwrapped)
+                    break  # 只保存一侧
 
+        # 方向输出：事件级方向锁存
+        # 注意：wave_direction 用于 gesture_presets 学习记录
+        # 符号约定（用户视角）：向右挥手 = -1（上一首），向左挥手 = +1（下一首）
+        self._wave_direction = self._wave_event_dir if self._wave_event_active else 0.0
+
+        # 挥手事件生命周期管理
         if best_span > 0:
+            # 检测到有效挥手：保持事件活跃，输出强度
             intensity = min(best_span * 2.5, 1.0)
+            self._wave_still_frames = 0  # 重置静止计数
             return intensity
+        elif self._wave_event_active:
+            # 未检测到挥手，但事件仍活跃：增加静止计数
+            self._wave_still_frames += 1
+            if self._wave_still_frames >= 10:  # 连续10帧无挥手 → 事件结束
+                self._wave_event_active = False
+                self._wave_direction = 0.0
+                self._wave_event_dir = 0.0
+                self._wave_still_frames = 0
+            return 0.0
 
         return 0.0
 
@@ -1768,6 +2236,19 @@ class MotionCapture:
             'pose_hand_dy_R': None,
             'pose_spread_L': None,
             'pose_spread_R': None,
+            # 肩部特征（Pose 11/12 点，默认 None）
+            'shoulder_landmarks_L': None,
+            'shoulder_landmarks_R': None,
+            'shoulder_mid_x': None,
+            'shoulder_mid_y': None,
+            'shoulder_width': None,
+            'shoulder_tilt': None,
+            # 面部精细特征（FaceLandmarker 478 点，默认空）
+            'face_landmarks': [],
+            'face_present': False,
+            'face_mouth_open': None,
+            'face_smile': None,
+            'face_head_tilt': None,
         }
 
     def _deep_copy_features(self, features: Dict[str, Any]) -> Dict[str, Any]:
@@ -1783,6 +2264,9 @@ class MotionCapture:
         for key in ('hand_landmarks_L', 'hand_landmarks_R'):
             if key in copied and isinstance(copied[key], list):
                 copied[key] = [dict(pt) for pt in copied[key]]
+        # face_landmarks：单层 dict 列表（478 个点）
+        if 'face_landmarks' in copied and isinstance(copied['face_landmarks'], list):
+            copied['face_landmarks'] = [dict(pt) for pt in copied['face_landmarks']]
         return copied
 
 

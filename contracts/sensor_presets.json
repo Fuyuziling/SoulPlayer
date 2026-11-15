@@ -1,0 +1,258 @@
+{
+  "version": 1,
+  "description": "传感器动作预设。每个预设 = 一组特征条件 + 一个动作 + 优先级 + 归属模式。手机端 core/engine.ts 按 priority 从高到低依次试匹配，首个命中即出事件，一帧最多出一个事件。modes 决定该预设属于哪个使用模式（见 motion_modes.json）：日常模式的六条精细手势与跑步模式互斥，切换模式时不匹配的预设整体移出匹配池，不再算特征也不再参与判定。阈值来源见每条的 calibrate 字段。",
+  "gates": {
+    "require_window_full": true,
+    "min_sample_hz": 25,
+    "note_sample_hz": "低于 25Hz 时窗口分辨率不足（0.36s 只有 9 个样本），宁可不出判定，也不要出误判",
+    "noise_floor_multiplier": 3.0,
+    "note_noise_floor": "所有幅度门取 max(预设值, 本机噪声底 × 该倍数)。噪底由启动时静置 1.2s 校准得到，用于吸收机型差异",
+    "direction_lock_frames": 3,
+    "note_direction_lock": "沿用 PC 端采集层的方向锁存：判定出方向后，需连续 N 帧方向不再翻转才允许下一次同向事件，防止回程二次触发",
+    "steady_reset_ms": 150,
+    "note_steady_reset": "静止超过该时长视为动作结束，重置速度/位移累积与方向锁存",
+    "buffer_ms": 1200,
+    "note_buffer": "缓冲保留 1.2s，各预设用自己的 window_ms 在其中取子窗口。动作的时间尺度不同（甩动 0.3s、摇一摇 0.5s、翻面 0.5s），用一个窗口同时服务所有动作必然顾此失彼。"
+  },
+  "presets": [
+    {
+      "id": "sensor_flick_next",
+      "name": "向左甩",
+      "gesture": "flick",
+      "action": "player_next",
+      "enabled": true,
+      "priority": 20,
+      "description": "握机横向甩动一次，方向朝左（-x）。与 PC 端「向左挥手 = 下一首」保持同一语义，也符合手机音乐 App 左滑下一首的直觉",
+      "conditions": {
+        "lateral_span": {
+          "min": 0.14
+        },
+        "lateral_direction": {
+          "max": -0.5
+        },
+        "vertical_ratio": {
+          "max": 0.7
+        },
+        "lin_acc_peak": {
+          "min": 11
+        },
+        "peak_count": {
+          "max": 4
+        },
+        "tilt_delta_deg": {
+          "max": 90
+        },
+        "vel_reversals": {
+          "max": 1
+        },
+        "acc_sign_changes": {
+          "max": 1
+        }
+      },
+      "calibrate": "轻晃手机幅度峰值约 5~10 m/s^2、位移 3~8cm，快速甩动峰值 15~40、位移 20~40cm。幅度门 11 与跨度门 0.14m 落在两者中间的空档，留 2 倍余量。 另加 vel_reversals≤1：甩动是单向冲量，速度不穿零；摇动是往复，0.36s 内至少穿零 3 次。只靠位移跨度会把\"边摇边走\"误判成甩动。",
+      "window_ms": 360,
+      "modes": [
+        "still"
+      ]
+    },
+    {
+      "id": "sensor_flick_prev",
+      "name": "向右甩",
+      "gesture": "flick",
+      "action": "player_prev",
+      "enabled": true,
+      "priority": 20,
+      "description": "握机横向甩动一次，方向朝右（+x）",
+      "conditions": {
+        "lateral_span": {
+          "min": 0.14
+        },
+        "lateral_direction": {
+          "min": 0.5
+        },
+        "vertical_ratio": {
+          "max": 0.7
+        },
+        "lin_acc_peak": {
+          "min": 11
+        },
+        "peak_count": {
+          "max": 4
+        },
+        "tilt_delta_deg": {
+          "max": 90
+        },
+        "vel_reversals": {
+          "max": 1
+        },
+        "acc_sign_changes": {
+          "max": 1
+        }
+      },
+      "calibrate": "与向左甩对称。方向门用 ±0.5 而不是 ±1，因为净位移方向在短窗口内不会正好是 ±1。 另加 vel_reversals≤1：甩动是单向冲量，速度不穿零；摇动是往复，0.36s 内至少穿零 3 次。只靠位移跨度会把\"边摇边走\"误判成甩动。",
+      "window_ms": 360,
+      "modes": [
+        "still"
+      ]
+    },
+    {
+      "id": "sensor_flip_toggle",
+      "name": "翻面",
+      "gesture": "flip",
+      "action": "player_toggle",
+      "enabled": true,
+      "priority": 18,
+      "description": "把手机翻过来使屏幕朝下；再翻回来恢复。任意方向都只切一次",
+      "conditions": {
+        "flip_angle_deg": {
+          "min": 62
+        },
+        "face_transition": {
+          "in": [
+            "to_down",
+            "from_down"
+          ]
+        },
+        "gyro_mag_peak": {
+          "min": 1.6
+        }
+      },
+      "calibrate": "竖直握持时俯仰角为 90°，翻面朝下为 180°，实际只转过 90°——阈值定 62（实测合成数据下全程极值 84°，重力估计滞后使测不到满 90°），而不是想当然的 130。真正把\"翻面\"和\"把手机放到桌上\"区分开的是 face_transition：两者都是 90° 变化，后者首末朝向是 edge→up，不落在 to_down/from_down 里。角速度门 1.6 rad/s 排除缓慢放下的动作。",
+      "window_ms": 800,
+      "modes": [
+        "still"
+      ]
+    },
+    {
+      "id": "sensor_shake_random",
+      "name": "摇一摇",
+      "gesture": "shake",
+      "action": "player_random",
+      "enabled": true,
+      "priority": 25,
+      "description": "连续快速摇晃两次以上，随机换一首",
+      "conditions": {
+        "acc_sign_changes": {
+          "min": 4
+        },
+        "peak_count": {
+          "min": 4
+        },
+        "lin_acc_peak": {
+          "min": 12
+        },
+        "still_ratio": {
+          "max": 0.2
+        }
+      },
+      "calibrate": "摇动的本质是往复：0.6s 窗口 @4.2Hz 有 2.5 个周期、加速度符号反转 5 次左右。优先级提到 25 高于甩动(20)，因为摇动起步阶段位移和速度都还像甩动，只有加速度符号反转能立刻分辨——等到位移特征拉开差距时甩动已经误触发了。",
+      "window_ms": 600,
+      "modes": [
+        "still"
+      ]
+    },
+    {
+      "id": "sensor_tilt_volume_down",
+      "name": "向左倾斜",
+      "gesture": "tilt",
+      "action": "volume_down",
+      "enabled": true,
+      "priority": 6,
+      "description": "握机向左侧倾斜并保持，连续降低音量",
+      "conditions": {
+        "roll_deg": {
+          "max": -28
+        },
+        "hold_ms": {
+          "min": 420
+        },
+        "gyro_mag_peak": {
+          "max": 0.9
+        },
+        "roll_std": {
+          "max": 3
+        }
+      },
+      "calibrate": "28° 是明显有意倾斜与自然握持松弛（通常 <12°）的分界；hold_ms 420ms 排除翻转/甩动过程中的瞬时过角；roll_std≤3 排除\"甩动后重力估计收敛\"造成的假倾斜——实测快速甩动会让瞬时 roll 冲到 41°并持续 0.7s，只看瞬时值和持续时长都挡不住，但那段 roll 是在连续滑动，标准差远大于稳定倾斜时的 1~2°。",
+      "window_ms": 450,
+      "modes": [
+        "still"
+      ]
+    },
+    {
+      "id": "sensor_tilt_volume_up",
+      "name": "向右倾斜",
+      "gesture": "tilt",
+      "action": "volume_up",
+      "enabled": true,
+      "priority": 6,
+      "description": "握机向右侧倾斜并保持，连续提高音量",
+      "conditions": {
+        "roll_deg": {
+          "min": 28
+        },
+        "hold_ms": {
+          "min": 420
+        },
+        "gyro_mag_peak": {
+          "max": 0.9
+        },
+        "roll_std": {
+          "max": 3
+        }
+      },
+      "calibrate": "与向右倾斜对称。",
+      "window_ms": 450,
+      "modes": [
+        "still"
+      ]
+    },
+    {
+      "id": "sensor_tap_double",
+      "name": "双击机身",
+      "gesture": "tap",
+      "action": "player_toggle",
+      "enabled": true,
+      "priority": 32,
+      "modes": [
+        "run"
+      ],
+      "description": "跑步中连续敲两下手机背面，暂停或继续",
+      "conditions": {
+        "tap_pairs": {
+          "min": 1
+        },
+        "narrow_pulse_width_ms": {
+          "max": 60
+        }
+      },
+      "calibrate": "跑步时每一步都会产生 15~25 m/s^2 的冲击，与敲击的峰值完全重叠，所以峰值不能用。真正能分开两者的是**脉冲宽度**：指尖敲击的冲击只持续 20~50ms（100Hz 下 2~5 个样本），而脚步冲击经身体和衣物传导后宽度在 80ms 以上。宽度是主判据，成对性做二次确认——脚步是单侧周期性，每一步独立；双击是成对的，两击间隔 120~320ms。两个条件一起用，跑步本身永远凑不出'一对窄脉冲'。",
+      "window_ms": 700
+    },
+    {
+      "id": "sensor_wrist_raise",
+      "name": "抬腕",
+      "gesture": "raise",
+      "action": "announce_track",
+      "enabled": true,
+      "priority": 26,
+      "modes": [
+        "run"
+      ],
+      "description": "跑步中把手机抬到面前停一下，播报当前曲目",
+      "conditions": {
+        "pitch_deg": {
+          "max": 50
+        },
+        "rhythm_break_ms": {
+          "min": 350
+        },
+        "hold_ms": {
+          "min": 500
+        }
+      },
+      "calibrate": "抬腕的本质不是姿态变化，而是**节律中断**：跑步时手臂在摆动，加速度节律连续；抬手看屏那一刻手臂停止摆动，节律中断，同时俯仰角从垂握的约 90° 变到朝脸的 30~45°。只卡姿态会把跑步中正常摆臂误判成抬腕（摆臂本身让 pitch 在 70~110° 之间晃），所以 pitch≤50 必须与 rhythm_break_ms≥350 同时成立。**为什么用 pitch 绝对值而不是首末差值**：差值随窗口滑动会衰减——抬到位后过 0.6s，窗口首样本已经变成抬腕过程中的中间值，差值从 50° 掉到 15° 以下，条件提前失效，hold_ms 永远累计不够。绝对值在保持期间恒定，才能稳定计时。代价是手机平放在桌上也会满足（pitch 0），此时会播报一次歌名——误触代价本就是零，可以接受。绑定播报而不是切歌：抬腕看屏是用户想知道在放什么的自然动作，绑成切歌会频繁误切。",
+      "window_ms": 900
+    }
+  ]
+}

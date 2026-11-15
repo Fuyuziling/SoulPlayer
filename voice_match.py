@@ -19,6 +19,7 @@ B 方案：录制用户的声音作为音频模板，之后实时监听麦克风
 from __future__ import annotations
 
 import json
+import os
 import queue
 import threading
 import time
@@ -82,26 +83,113 @@ _EMBED_MODEL = None
 _EMBED_PROCESSOR = None
 _EMBED_FAILED = False       # 哨兵：加载失败后不再重复尝试（避免逐模板重试卡顿）
 
+# 【黑屏修复】HuggingFace from_pretrained 默认超时很长，网络不通（如代理返回
+# 502 Bad Gateway）时会阻塞 40 秒以上；且 import transformers 本身需 ~8 秒。
+# 该加载发生在主循环启动之前，pygame 窗口早已创建 → 用户看到长时间黑屏。
+# 措施：
+#   1) 先零成本检查本地缓存目录——无缓存直接降级 MFCC+DTW（不导入 torch、
+#      不联网，启动零等待）；
+#   2) 本地有缓存（或用户设置 SOULPLAYER_VOICE_EMBED_ONLINE=1 显式要求联网）
+#      才走加载/下载路径，并限制超时 + 后台线程时间预算。
+os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "5")
+os.environ.setdefault("HF_HUB_ETAG_TIMEOUT", "5")
+_EMBED_ONLINE_BUDGET_SEC = 10.0   # 在线下载时间预算（秒），超过即放弃并降级
+_EMBED_ONLINE_ENV = "SOULPLAYER_VOICE_EMBED_ONLINE"  # 置 1 强制允许在线下载
+
+
+def _hf_local_snapshot_exists(repo_id: str) -> bool:
+    """零成本检查 HuggingFace 本地缓存中是否已有该模型的快照（不导入重型库）。"""
+    roots = []
+    for key in ("HF_HUB_CACHE",):
+        v = os.environ.get(key)
+        if v:
+            roots.append(v)
+    v = os.environ.get("HF_HOME")
+    if v:
+        roots.append(os.path.join(v, "hub"))
+    roots.append(os.path.join(os.path.expanduser("~"), ".cache", "huggingface", "hub"))
+    sub = "models--" + repo_id.replace("/", "--")
+    for root in roots:
+        snaps = os.path.join(root, sub, "snapshots")
+        try:
+            if os.path.isdir(snaps) and any(os.scandir(snaps)):
+                return True
+        except OSError:
+            continue
+    return False
+
 
 def _load_embed_model():
-    """懒加载 wav2vec2 模型（首次调用时）。失败返回 None，保持降级。"""
+    """懒加载 wav2vec2 模型（首次调用时）。失败返回 None，保持降级。
+
+    黑屏修复版加载策略（绝不阻塞启动）：
+      1) 本地无缓存且未显式要求联网 → 立即降级（零等待）；
+      2) 本地有缓存 → local_files_only 直读（无网络等待）；
+      3) 显式要求联网 → 后台线程下载 + 10 秒预算，超时降级。
+    """
     global EMBED_AVAILABLE, _EMBED_MODEL, _EMBED_PROCESSOR, _EMBED_FAILED
     if _EMBED_MODEL is not None:
         return _EMBED_MODEL, _EMBED_PROCESSOR
     if _EMBED_FAILED:
         return None, None
+
+    cached = _hf_local_snapshot_exists(EMBED_MODEL_NAME)
+    allow_online = os.environ.get(_EMBED_ONLINE_ENV, "").strip() == "1"
+    if not cached and not allow_online:
+        EMBED_AVAILABLE = False
+        _EMBED_FAILED = True
+        print("[VoiceMatch] 内容嵌入模型本地无缓存，跳过在线下载以保障启动速度，"
+              f"回退 MFCC+DTW（如需启用：预先缓存模型，或设置 {_EMBED_ONLINE_ENV}=1）")
+        return None, None
+
     try:
         import torch  # noqa: F401
         from transformers import Wav2Vec2Processor, Wav2Vec2Model
-        _EMBED_PROCESSOR = Wav2Vec2Processor.from_pretrained(EMBED_MODEL_NAME)
-        _EMBED_MODEL = Wav2Vec2Model.from_pretrained(EMBED_MODEL_NAME).eval()
-        EMBED_AVAILABLE = True
-        print("[VoiceMatch] 内容嵌入模型已加载（标准模式）")
     except Exception as e:
         EMBED_AVAILABLE = False
         _EMBED_FAILED = True
-        print(f"[VoiceMatch] 内容嵌入不可用，回退 MFCC+DTW: {e}")
-    return _EMBED_MODEL, _EMBED_PROCESSOR
+        print(f"[VoiceMatch] 内容嵌入依赖缺失，使用 MFCC+DTW: {e}")
+        return None, None
+
+    # 本地缓存直读（不联网）
+    if cached:
+        try:
+            _EMBED_PROCESSOR = Wav2Vec2Processor.from_pretrained(
+                EMBED_MODEL_NAME, local_files_only=True)
+            _EMBED_MODEL = Wav2Vec2Model.from_pretrained(
+                EMBED_MODEL_NAME, local_files_only=True).eval()
+            EMBED_AVAILABLE = True
+            print("[VoiceMatch] 内容嵌入模型已加载（本地缓存，标准模式）")
+            return _EMBED_MODEL, _EMBED_PROCESSOR
+        except Exception:
+            _EMBED_MODEL = None
+            _EMBED_PROCESSOR = None
+
+    # 在线下载：后台线程 + 硬性时间预算，超时立即降级，不再拖慢启动
+    box: dict = {"model": None, "proc": None, "err": None}
+
+    def _download():
+        try:
+            box["proc"] = Wav2Vec2Processor.from_pretrained(EMBED_MODEL_NAME)
+            box["model"] = Wav2Vec2Model.from_pretrained(EMBED_MODEL_NAME).eval()
+        except Exception as e:  # noqa: BLE001
+            box["err"] = e
+
+    th = threading.Thread(target=_download, daemon=True)
+    th.start()
+    th.join(_EMBED_ONLINE_BUDGET_SEC)
+    if box["model"] is not None and box["proc"] is not None:
+        _EMBED_PROCESSOR = box["proc"]
+        _EMBED_MODEL = box["model"]
+        EMBED_AVAILABLE = True
+        print("[VoiceMatch] 内容嵌入模型已下载并加载（标准模式）")
+        return _EMBED_MODEL, _EMBED_PROCESSOR
+    EMBED_AVAILABLE = False
+    _EMBED_FAILED = True
+    reason = box["err"] if box["err"] is not None else \
+        f"下载超时(>{_EMBED_ONLINE_BUDGET_SEC:.0f}s)，已降级避免阻塞启动"
+    print(f"[VoiceMatch] 内容嵌入不可用，回退 MFCC+DTW: {reason}")
+    return None, None
 
 
 def audio_embedding(samples: np.ndarray) -> Optional[np.ndarray]:
@@ -148,24 +236,80 @@ _SPEAKER_CACHE_DIR = str(Path(__file__).parent.resolve() / "speaker_model_cache"
 _SPEAKER_FAILED = False      # 哨兵：加载失败后不再重复尝试（避免逐模板重试）
 
 
+# 【黑屏修复·声纹】与内容嵌入（wav2vec2）同理：speechbrain 的 from_hparams 会联网
+# 下载模型，网络不通时阻塞数十秒；且 import speechbrain 本身耗时可观。
+# 该加载发生在主循环启动前的模板加载阶段（VoiceTrigger 逐个模板提取特征时
+# 无条件调用 speaker_embedding）→ 表现为启动黑屏。
+# 措施：1) 本地无缓存且未显式允许联网 → 立即降级（零等待，连 speechbrain 都不导入）；
+#       2) 有缓存或显式允许 → 后台线程加载 + 时间预算，超时即降级。
+_SPEAKER_ONLINE_BUDGET_SEC = 10.0   # 在线加载时间预算（秒），超过即放弃并降级
+_SPEAKER_ONLINE_ENV = "SOULPLAYER_VOICE_SPEAKER_ONLINE"  # 置 1 强制允许在线下载
+
+
+def _speaker_cache_ready() -> bool:
+    """零成本检查本地声纹模型缓存是否可用（不导入 speechbrain）。"""
+    try:
+        d = Path(_SPEAKER_CACHE_DIR)
+        if not d.is_dir():
+            return False
+        # speechbrain from_hparams 落盘形态：hyperparams.yaml + 权重(.ckpt/.pt/.pth)
+        if not (d / "hyperparams.yaml").is_file():
+            return False
+        return any(f.suffix.lower() in (".ckpt", ".pt", ".pth")
+                   for f in d.rglob("*") if f.is_file())
+    except OSError:
+        return False
+
+
 def _load_speaker_model():
-    """懒加载 ECAPA-TDNN 声纹模型（首次调用时）。失败保持降级。"""
+    """懒加载 ECAPA-TDNN 声纹模型（首次调用时）。失败保持降级。
+
+    黑屏修复版加载策略（绝不阻塞启动）：
+      1) 本地无缓存且未显式要求联网 → 立即降级（零等待）；
+      2) 本地有缓存（或显式要求联网）→ 后台线程加载 + 10 秒预算，超时降级。
+    """
     global SPEAKER_AVAILABLE, _SPEAKER_MODEL, _SPEAKER_FAILED
     if _SPEAKER_MODEL is not None:
         return _SPEAKER_MODEL
     if _SPEAKER_FAILED:
         return None
-    try:
-        import speechbrain.inference.speaker  # noqa: F401
-        _SPEAKER_MODEL = speechbrain.inference.speaker.EncoderClassifier.from_hparams(
-            source=SPEAKER_MODEL_NAME, savedir=_SPEAKER_CACHE_DIR, run_opts={"device": "cpu"})
-        SPEAKER_AVAILABLE = True
-        print("[VoiceMatch] 声纹嵌入模型已加载（严格模式双因子）")
-    except Exception as e:
+
+    cached = _speaker_cache_ready()
+    allow_online = os.environ.get(_SPEAKER_ONLINE_ENV, "").strip() == "1"
+    if not cached and not allow_online:
         SPEAKER_AVAILABLE = False
         _SPEAKER_FAILED = True
-        print(f"[VoiceMatch] 声纹嵌入不可用，保持标准模式: {e}")
-    return _SPEAKER_MODEL
+        print("[VoiceMatch] 声纹模型本地无缓存，跳过在线下载以保障启动速度，"
+              f"保持标准模式（如需启用：预先缓存模型，或设置 {_SPEAKER_ONLINE_ENV}=1）")
+        return None
+
+    box: dict = {"model": None, "err": None}
+
+    def _load():
+        try:
+            import speechbrain.inference.speaker as spk
+            box["model"] = spk.EncoderClassifier.from_hparams(
+                source=SPEAKER_MODEL_NAME, savedir=_SPEAKER_CACHE_DIR,
+                run_opts={"device": "cpu"})
+        except Exception as e:  # noqa: BLE001
+            box["err"] = e
+
+    th = threading.Thread(target=_load, daemon=True)
+    th.start()
+    th.join(_SPEAKER_ONLINE_BUDGET_SEC)
+
+    if box["model"] is not None:
+        _SPEAKER_MODEL = box["model"]
+        SPEAKER_AVAILABLE = True
+        print("[VoiceMatch] 声纹嵌入模型已加载（严格模式双因子）")
+        return _SPEAKER_MODEL
+
+    SPEAKER_AVAILABLE = False
+    _SPEAKER_FAILED = True
+    reason = box["err"] if box["err"] is not None else (
+        f"加载超时(>{_SPEAKER_ONLINE_BUDGET_SEC:.0f}s)，已降级避免阻塞启动")
+    print(f"[VoiceMatch] 声纹嵌入不可用，保持标准模式: {reason}")
+    return None
 
 
 def speaker_embedding(samples: np.ndarray) -> Optional[np.ndarray]:

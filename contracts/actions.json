@@ -1,0 +1,135 @@
+{
+  "version": 1,
+  "description": "跨端动作与冷却契约。动作 id 两端共用；冷却语义沿用 PC 端 ACTION_COOLDOWN_RULES（self_cd / peer_cd / peers / also_block），手机端 core/cooldown.ts 按同一套规则解释。",
+  "cooldown_semantics": {
+    "self_cd": "同一动作自身的重复触发间隔（秒）",
+    "peer_cd": "与本动作互为 peers 的配对动作之间必须间隔的时间（秒）",
+    "peers": "互为配对的互斥动作 id",
+    "also_block": "本动作触发后，连带压制这些动作的时长（同 self_cd）",
+    "note": "未登记的动作一律放行，与 PC 端行为一致",
+    "block_cd": "also_block 的压制时长（秒），缺省取压制者自己的 self_cd。必须显式给，否则压制时长会被被压制动作的 self_cd 决定。"
+  },
+  "actions": {
+    "player_next": {
+      "label": "下一首",
+      "how": "视觉：左手向左挥动 / 传感器：向左甩动手机",
+      "cooldown": {
+        "self_cd": 0.35,
+        "peer_cd": 0.6,
+        "peers": [
+          "player_prev"
+        ],
+        "also_block": [
+          "player_custom"
+        ]
+      }
+    },
+    "player_prev": {
+      "label": "上一首",
+      "how": "视觉：右手向右挥动 / 传感器：向右甩动手机",
+      "cooldown": {
+        "self_cd": 0.35,
+        "peer_cd": 0.6,
+        "peers": [
+          "player_next"
+        ],
+        "also_block": [
+          "player_custom"
+        ]
+      }
+    },
+    "player_toggle": {
+      "label": "播放 / 暂停",
+      "how": "传感器：手机翻面（屏幕朝下）",
+      "cooldown": {
+        "self_cd": 1.0,
+        "also_block": []
+      },
+      "note": "传感器只有一个翻转方向可感知，所以合并为切换语义；PC 端的 pause/play 分开，此处不复用那两个 id"
+    },
+    "player_pause": {
+      "label": "暂停",
+      "how": "视觉：掌心悬停",
+      "cooldown": {
+        "self_cd": 1.0,
+        "also_block": []
+      }
+    },
+    "player_play": {
+      "label": "播放",
+      "how": "视觉：掌心悬停（二次）",
+      "cooldown": {
+        "self_cd": 1.0,
+        "also_block": []
+      }
+    },
+    "player_random": {
+      "label": "随机一首",
+      "how": "传感器：摇一摇",
+      "cooldown": {
+        "self_cd": 1.8,
+        "block_cd": 1.8,
+        "also_block": [
+          "player_next",
+          "player_prev"
+        ]
+      },
+      "note": "摇动收尾的余波在位移特征上与甩动几乎一致，必须连带压制切歌。压制时长跟随 self_cd，所以这里给 1.8s——摇一摇本身不该连发，长一点没副作用，但能盖住整段余波。"
+    },
+    "volume_up": {
+      "label": "音量 +",
+      "how": "传感器：向左倾斜并保持",
+      "cooldown": {
+        "self_cd": 0.18,
+        "peer_cd": 0.08,
+        "peers": [
+          "volume_down"
+        ],
+        "also_block": []
+      },
+      "note": "音量是连续调节类动作，冷却本身充当重复频率上限（约 5.5 次/秒）"
+    },
+    "volume_down": {
+      "label": "音量 −",
+      "how": "传感器：向右倾斜并保持",
+      "cooldown": {
+        "self_cd": 0.18,
+        "peer_cd": 0.08,
+        "peers": [
+          "volume_up"
+        ],
+        "also_block": []
+      }
+    },
+    "player_custom": {
+      "label": "自定义动作",
+      "how": "视觉：DTW 模板匹配",
+      "cooldown": {
+        "self_cd": 1.0,
+        "also_block": [
+          "player_next",
+          "player_prev"
+        ]
+      }
+    },
+    "player_pause_auto": {
+      "label": "自动暂停",
+      "how": "跑步模式：节律中断 6 秒后自动触发",
+      "cooldown": {
+        "self_cd": 3.0,
+        "also_block": []
+      },
+      "note": "由模式状态机在退出跑步态并满足 idle_ms 时发出，不是预设匹配出来的动作。冷却 3s 只是防止状态在阈值边界上抖动时连发两次暂停。"
+    },
+    "announce_track": {
+      "label": "播报曲目",
+      "how": "跑步模式：抬腕",
+      "cooldown": {
+        "self_cd": 1.5,
+        "also_block": []
+      },
+      "note": "只播报不切歌。抬腕是用户想看屏幕的自然动作，绑成切歌会频繁误切，绑成播报则误触无害。"
+    }
+  },
+  "modes_note": "动作 id 跨模式共用。player_toggle 在两种模式下都存在（日常=翻面，跑步=双击），这是有意的：同一个语义在不同模式下用不同的物理动作表达，冷却表也共用，所以从跑步退回日常时不需要重置冷却状态。"
+}
