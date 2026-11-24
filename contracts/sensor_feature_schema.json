@@ -1,0 +1,64 @@
+{
+  "schema_version": 1,
+  "description": "传感器通道特征契约。PC 端（Python）与手机端（TypeScript）共用同一份字段定义，避免两边手抄漂移。所有字段在手机端由 core/features.ts 产出，PC 端接收联动数据时按同名读取。",
+  "units": {
+    "acc": "m/s^2",
+    "vel": "m/s",
+    "disp": "m",
+    "angle": "deg",
+    "time": "s",
+    "gyro": "rad/s"
+  },
+  "coordinate_system": {
+    "note": "设备坐标系，与 W3C DeviceMotion 一致。屏幕竖直握持、正面朝向用户时：",
+    "x": "屏幕向右",
+    "y": "屏幕向上",
+    "z": "垂直屏幕向外（指向用户）",
+    "horizontal_plane": ["x", "y"],
+    "gravity_at_rest": [0, 0, -9.81]
+  },
+  "window": {
+    "seconds": 0.36,
+    "nominal_hz": 60,
+    "max_samples": 64,
+    "note": "0.36s 对应 PC 端挥手判定使用的 20 帧窗口。窗口内保留原始样本，特征在窗口上重算，不做逐帧累加，避免积分漂移随时间累积。"
+  },
+  "fields": {
+    "timestamp": { "type": "number", "unit": "s", "desc": "窗口末端时间戳（performance.now 换算的秒）" },
+    "source": { "type": "string", "enum": ["sensor"], "desc": "通道标识，用于 PC 端区分视觉特征与传感器特征" },
+    "sample_hz": { "type": "number", "unit": "Hz", "desc": "实际采样频率（按最近 30 个样本间隔估计）" },
+    "window_full": { "type": "boolean", "desc": "窗口是否已填满。未填满时不产出判定，防止启动瞬间误触" },
+    "lin_acc_peak": { "type": "number", "unit": "m/s^2", "desc": "去重力后线性加速度模长峰值。静置噪声约 0.2~0.6" },
+    "lin_acc_rms": { "type": "number", "unit": "m/s^2", "desc": "去重力后线性加速度 RMS，衡量整段能量" },
+    "vel_mag_peak": { "type": "number", "unit": "m/s", "desc": "速度模长峰值（一次积分）" },
+    "vel_h": { "type": "number", "unit": "m/s", "desc": "水平面速度模长峰值（x/y 合成），用于排除竖直抖动" },
+    "vertical_ratio": { "type": "number", "desc": "|vz| / (|vh| + eps)，>0.7 视为竖直主导，不是横向甩动" },
+    "dominant_axis": { "type": ["string", "null"], "enum": ["x", "y", "z", null], "desc": "水平面内位移主导轴" },
+    "lateral_span": { "type": "number", "unit": "m", "desc": "沿主导轴的位移跨度（max-min）。与 PC 端 arm_horizontal_motion 语义对齐" },
+    "lateral_direction": { "type": "number", "enum": [-1, 0, 1], "desc": "净位移方向：+1 沿轴正向，-1 反向，0 无法判定" },
+    "disp_x": { "type": "number", "unit": "m", "desc": "窗口内 x 向位移" },
+    "disp_y": { "type": "number", "unit": "m", "desc": "窗口内 y 向位移" },
+    "gyro_mag_peak": { "type": "number", "unit": "rad/s", "desc": "角速度模长峰值" },
+    "pitch_deg": { "type": "number", "unit": "deg", "desc": "设备俯仰角。0=屏幕朝上平放，180=屏幕朝下，90=竖直握持" },
+    "roll_deg": { "type": "number", "unit": "deg", "desc": "设备横滚角，左右倾斜为 ±" },
+    "flip_angle_deg": { "type": "number", "unit": "deg", "desc": "窗口内绕俯仰轴累计转过的角度（取 |角速度| 在俯仰轴投影的积分）" },
+    "face_state": { "type": "string", "enum": ["up", "down", "edge", "unknown"], "desc": "屏幕朝向：up=朝上，down=朝下，edge=侧立" },
+    "face_transition": {
+      "type": "string",
+      "enum": ["none", "to_down", "from_down"],
+      "desc": "窗口首末朝向是否穿越朝下。这是区分「翻面」与「把手机放到桌上」的唯一可靠依据：两者俯仰角都变化 90°，但前者是 edge→down 或 down→edge，后者是 edge→up。"
+    },
+    "peak_count": { "type": "number", "desc": "加速度模长的显著峰值个数（高于噪声门且间隔>80ms）" },
+    "peak_interval_ms": { "type": "number", "desc": "相邻峰值间隔中位数，摇动通常 120~250ms" },
+    "still_ratio": { "type": "number", "desc": "窗口内静止帧占比（线性加速度 < 静止门）" },
+    "is_still": { "type": "boolean", "desc": "整窗静止：still_ratio > 0.9 且 lin_acc_peak < 3×噪声门" },
+    "noise_floor": { "type": "number", "unit": "m/s^2", "desc": "启动校准得到的本机静置噪声底，所有幅度门都相对它做下限" }
+  },
+  "derived_from_python": {
+    "note": "PC 端 motion_capture.py 的视觉特征不受影响；此契约只在手机端产出、PC 端按需消费。两端的判断语义对应关系：",
+    "arm_horizontal_motion": "lateral_span",
+    "wave_direction": "lateral_direction",
+    "motion_energy": "lin_acc_rms",
+    "palm_hover": "none"
+  }
+}

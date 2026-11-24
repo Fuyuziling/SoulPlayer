@@ -1,0 +1,799 @@
+/* SoulPlayer 手机端样式。
+   配色沿用 PC 端的暖琥珀低饱和体系（#C4956A 强调 / #2B2B2B 深暖灰），
+   保证两端是同一个产品，而不是"另一套皮肤"。 */
+
+:root {
+  --bg: #171513;
+  --bg-2: #1f1c19;
+  --panel: #262220;
+  --card: #2e2926;
+  --card-2: #363029;
+  --line: #3d3631;
+  --text: #ede8e3;
+  --dim: #a89f97;
+  --muted: #7a716a;
+  --accent: #c4956a;
+  --accent-soft: #d9b18c;
+  --accent-glow: rgba(196, 149, 106, 0.28);
+  --ok: #86b06f;
+  --warn: #d9a03f;
+  --danger: #c96a5c;
+  --radius: 18px;
+  --safe-b: env(safe-area-inset-bottom, 0px);
+  --safe-t: env(safe-area-inset-top, 0px);
+}
+
+* {
+  box-sizing: border-box;
+  -webkit-tap-highlight-color: transparent;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  overflow: hidden;
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Noto Sans SC', 'Microsoft YaHei', system-ui,
+    sans-serif;
+  font-size: 15px;
+  line-height: 1.5;
+  /* 防止 iOS 双击缩放与橡皮筋 */
+  touch-action: manipulation;
+  overscroll-behavior: none;
+}
+
+#app {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  padding: calc(var(--safe-t) + 10px) 16px calc(var(--safe-b) + 8px);
+  background: radial-gradient(120% 70% at 50% -10%, #2a2420 0%, var(--bg) 60%);
+}
+
+/* ── 启动门 ───────────────────────────── */
+.gate {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 22px;
+  padding: 0 4px;
+  animation: fadeUp 0.4s ease both;
+}
+
+.gate h1 {
+  font-size: 30px;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+  margin: 0;
+  background: linear-gradient(120deg, var(--accent-soft), var(--accent) 60%, #9c7350);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+.gate .lead {
+  color: var(--dim);
+  font-size: 14px;
+  line-height: 1.7;
+  margin: 0;
+}
+
+.gate .rules {
+  display: grid;
+  gap: 10px;
+  margin-top: 4px;
+}
+
+.gate .rule {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 14px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+}
+
+.gate .rule .ico {
+  font-size: 20px;
+  width: 28px;
+  text-align: center;
+}
+
+.gate .rule .t {
+  font-size: 14px;
+  color: var(--text);
+}
+
+.gate .rule .d {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.gate .hint {
+  font-size: 12px;
+  color: var(--muted);
+  line-height: 1.6;
+}
+
+.gate .hint.warn {
+  color: var(--warn);
+}
+
+/* ── 顶栏 ─────────────────────────────── */
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 2px 2px 10px;
+}
+
+.topbar-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.brand {
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: 0.6px;
+  color: var(--accent-soft);
+}
+
+.brand span {
+  color: var(--muted);
+  font-weight: 400;
+  font-size: 12px;
+  margin-left: 6px;
+  letter-spacing: 0;
+}
+
+.status {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--muted);
+  transition: background 0.3s;
+}
+
+.dot.live {
+  background: var(--ok);
+  box-shadow: 0 0 8px rgba(134, 176, 111, 0.7);
+  animation: breathe 2.4s ease-in-out infinite;
+}
+
+.dot.err {
+  background: var(--danger);
+}
+
+/* ── 舞台：唱片 + 动作反馈 ────────────────── */
+.stage {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 150px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin: 2px 0 6px;
+}
+
+.disc {
+  position: relative;
+  width: min(56vw, 220px);
+  aspect-ratio: 1;
+  border-radius: 50%;
+  background:
+    radial-gradient(circle at 50% 50%, #2b2521 0 18%, transparent 18.5%),
+    repeating-radial-gradient(circle at 50% 50%, #26211d 0 2px, #221e1a 2px 4px);
+  border: 1px solid #3a332d;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: 0 18px 40px -18px #000, inset 0 0 30px rgba(0, 0, 0, 0.5);
+  transition: transform 0.3s ease;
+}
+
+.disc.playing {
+  animation: spin 7s linear infinite;
+}
+
+.disc .hole {
+  width: 26%;
+  aspect-ratio: 1;
+  border-radius: 50%;
+  background: radial-gradient(circle at 40% 35%, #4a3f36, #211d19);
+  border: 1px solid #453b33;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 20px;
+  color: var(--accent);
+}
+
+.disc.pulse {
+  animation: pulseRing 0.55s ease-out;
+}
+
+.ripple {
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  border: 2px solid var(--accent);
+  opacity: 0;
+  pointer-events: none;
+}
+
+.ripple.go {
+  animation: ripple 0.8s ease-out;
+}
+
+.gesture-toast {
+  position: absolute;
+  left: 50%;
+  bottom: 4px;
+  transform: translate(-50%, 12px);
+  padding: 8px 18px;
+  border-radius: 999px;
+  background: rgba(196, 149, 106, 0.14);
+  border: 1px solid var(--accent-glow);
+  color: var(--accent-soft);
+  font-size: 14px;
+  font-weight: 500;
+  letter-spacing: 0.4px;
+  opacity: 0;
+  transition: all 0.25s ease;
+  white-space: nowrap;
+  backdrop-filter: blur(8px);
+}
+
+.gesture-toast.show {
+  opacity: 1;
+  transform: translate(-50%, 0);
+}
+
+/* ── 曲目 ─────────────────────────────── */
+.now {
+  padding: 0 2px;
+}
+
+.now .title {
+  font-size: 17px;
+  font-weight: 600;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.now .sub {
+  font-size: 12px;
+  color: var(--muted);
+  margin-top: 2px;
+  display: flex;
+  justify-content: space-between;
+  font-variant-numeric: tabular-nums;
+}
+
+.progress {
+  margin-top: 10px;
+  height: 5px;
+  border-radius: 999px;
+  background: #332d28;
+  overflow: hidden;
+  position: relative;
+}
+
+.progress .fill {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 0;
+  background: linear-gradient(90deg, #9c7350, var(--accent-soft));
+  border-radius: 999px;
+  transition: width 0.2s linear;
+}
+
+/* ── 控制 ─────────────────────────────── */
+.controls {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 26px;
+  padding: 16px 0 12px;
+}
+
+.btn-round {
+  width: 58px;
+  height: 58px;
+  border-radius: 50%;
+  border: 1px solid var(--line);
+  background: var(--card);
+  color: var(--text);
+  font-size: 20px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: transform 0.12s ease, background 0.2s;
+}
+
+.btn-round:active {
+  transform: scale(0.92);
+  background: var(--card-2);
+}
+
+.btn-main {
+  width: 72px;
+  height: 72px;
+  border-radius: 50%;
+  border: none;
+  background: linear-gradient(150deg, var(--accent-soft), var(--accent) 70%);
+  color: #241d16;
+  font-size: 26px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  box-shadow: 0 10px 26px -10px var(--accent-glow), inset 0 1px 0 rgba(255, 255, 255, 0.25);
+  transition: transform 0.12s ease;
+}
+
+.btn-main:active {
+  transform: scale(0.94);
+}
+
+/* ── 示波 ─────────────────────────────── */
+.scope-wrap {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  padding: 8px 10px 6px;
+  margin-bottom: 10px;
+}
+
+.scope-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 11px;
+  color: var(--muted);
+  margin-bottom: 4px;
+  font-variant-numeric: tabular-nums;
+}
+
+#scope {
+  display: block;
+  width: 100%;
+  height: 62px;
+}
+
+/* ── 面板 ─────────────────────────────── */
+.tabs {
+  display: flex;
+  gap: 6px;
+  padding: 3px;
+  background: var(--panel);
+  border-radius: 12px;
+  margin-bottom: 10px;
+}
+
+.tab {
+  flex: 1;
+  padding: 9px 0;
+  text-align: center;
+  font-size: 13px;
+  color: var(--dim);
+  border-radius: 9px;
+  cursor: pointer;
+  transition: all 0.2s;
+  border: 1px solid transparent;
+}
+
+.tab.active {
+  background: var(--card-2);
+  color: var(--accent-soft);
+  border-color: var(--line);
+}
+
+.sheet {
+  flex: 0 0 auto;
+  max-height: 34vh;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  padding-bottom: 4px;
+}
+
+.sheet::-webkit-scrollbar {
+  width: 0;
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 11px 13px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 13px;
+  margin-bottom: 7px;
+}
+
+.row .left {
+  min-width: 0;
+}
+
+.row .name {
+  font-size: 14px;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.row .desc {
+  font-size: 11px;
+  color: var(--muted);
+  margin-top: 2px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.row .meta {
+  font-size: 11px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  flex: 0 0 auto;
+}
+
+/* 曲库当前曲目：左侧强调条 + 名称着色，配合 ▶ 前缀与"播放中"标签，
+   扫一眼就能定位正在放的那首（真机反馈：原先找不到指针）。 */
+.row.cur {
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+
+.row.cur .name {
+  color: var(--accent-soft);
+}
+
+/* 运动模式开关行：模式级开关，与普通手势行视觉区分。 */
+.row.mode-row {
+  box-shadow: inset 3px 0 0 rgba(217, 160, 63, 0.8);
+}
+
+
+.switch {
+  flex: 0 0 auto;
+  width: 44px;
+  height: 26px;
+  border-radius: 999px;
+  background: #3a332d;
+  border: 1px solid var(--line);
+  position: relative;
+  cursor: pointer;
+  transition: background 0.2s;
+}
+
+.switch::after {
+  content: '';
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: #8b8178;
+  transition: all 0.2s;
+}
+
+.switch.on {
+  background: rgba(196, 149, 106, 0.28);
+  border-color: var(--accent-glow);
+}
+
+.switch.on::after {
+  left: 20px;
+  background: var(--accent);
+}
+
+.slider-row {
+  padding: 12px 13px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 13px;
+  margin-bottom: 7px;
+}
+
+.slider-row .head {
+  display: flex;
+  justify-content: space-between;
+  font-size: 13px;
+  margin-bottom: 8px;
+}
+
+.slider-row .head b {
+  color: var(--accent-soft);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+input[type='range'] {
+  -webkit-appearance: none;
+  width: 100%;
+  height: 22px;
+  background: transparent;
+}
+
+input[type='range']::-webkit-slider-runnable-track {
+  height: 4px;
+  border-radius: 999px;
+  background: #3a332d;
+}
+
+input[type='range']::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: var(--accent);
+  margin-top: -8px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.4);
+}
+
+.btn {
+  width: 100%;
+  padding: 12px;
+  border-radius: 12px;
+  border: 1px solid var(--line);
+  background: var(--card);
+  color: var(--text);
+  font-size: 14px;
+  cursor: pointer;
+  transition: background 0.2s;
+}
+
+.btn:active {
+  background: var(--card-2);
+}
+
+.btn.accent {
+  background: linear-gradient(150deg, var(--accent-soft), var(--accent));
+  color: #241d16;
+  border: none;
+  font-weight: 600;
+}
+
+.btn.ghost {
+  background: transparent;
+  color: var(--dim);
+}
+
+.btn:disabled {
+  opacity: 0.5;
+}
+
+.empty {
+  text-align: center;
+  color: var(--muted);
+  font-size: 13px;
+  padding: 22px 10px;
+  line-height: 1.7;
+}
+
+.tag {
+  display: inline-block;
+  padding: 1px 7px;
+  border-radius: 6px;
+  font-size: 10px;
+  background: rgba(196, 149, 106, 0.14);
+  color: var(--accent-soft);
+  border: 1px solid var(--accent-glow);
+}
+
+/* 三个预设文件夹卡片：主交互是"选文件夹 → 放入音乐"，所以卡片要像
+   容器（有体积、有左侧色条），而不是一排需要逐首点的小标签。
+   三色与跑步页状态行、行尾下拉的语义一致：舒缓=蓝，轻松=绿，激烈=橙。 */
+.folder-card {
+  margin: 10px 0;
+  padding: 12px 14px;
+  border-radius: 14px;
+  border: 1px solid var(--line);
+  border-left: 4px solid var(--muted);
+  background: var(--card);
+  cursor: pointer;
+}
+.folder-card.calm { border-left-color: #8fb8d4; }
+.folder-card.light { border-left-color: #86b06f; }
+.folder-card.intense { border-left-color: #d99a6a; }
+.folder-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+}
+.folder-name { font-size: 15px; font-weight: 600; color: var(--text); }
+.folder-count {
+  font-size: 12px;
+  color: var(--dim);
+  font-variant-numeric: tabular-nums;
+}
+.folder-hint {
+  font-size: 11px;
+  color: var(--muted);
+  margin: 4px 0 10px;
+  line-height: 1.5;
+}
+.btn.small {
+  width: auto;
+  min-height: 0;
+  padding: 6px 12px;
+  font-size: 12px;
+}
+.folder-title {
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--text);
+  padding: 10px 2px 4px;
+}
+
+/* 行尾归属下拉：只用于纠错/移动，视觉上比文件夹卡片低调。 */
+.group-select {
+  flex: 0 0 auto;
+  max-width: 96px;
+  font-size: 11px;
+  color: var(--dim);
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 3px 4px;
+}
+
+.note {
+  font-size: 11px;
+  color: var(--muted);
+  line-height: 1.65;
+  padding: 4px 4px 10px;
+}
+
+/* 模式芯片：日常 / 跑步。跑步态换成青绿，与"常用手势已关闭"的警示同色系，
+   让用户一眼看出当前不在日常模式。 */
+.mode-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 5px 10px;
+  border-radius: 999px;
+  font-size: 11px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  color: var(--dim);
+  transition: background 0.2s, border-color 0.2s, color 0.2s;
+}
+
+.mode-chip.on {
+  background: rgba(122, 176, 150, 0.16);
+  border-color: rgba(122, 176, 150, 0.42);
+  color: #9ed4bb;
+}
+
+/* 日常模式下检测到持续跑步：不自动切换，只把芯片点亮提示 */
+.mode-chip.suggest {
+  border-color: rgba(217, 160, 63, 0.5);
+  color: var(--warn);
+  animation: breathe 1.8s ease-in-out infinite;
+}
+
+.mode-chip .dotchip {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+/* 用 block 而不是 flex：flex 会把加粗前导词挤压成一字一行。
+   inline 的 b 元素自然随文本流折行，阅读顺序才正确。 */
+.banner {
+  padding: 9px 11px;
+  margin: 0 0 10px;
+  border-radius: 12px;
+  font-size: 11.5px;
+  line-height: 1.65;
+  background: rgba(217, 160, 63, 0.09);
+  border: 1px solid rgba(217, 160, 63, 0.26);
+  color: #d8c09a;
+}
+
+.banner b {
+  color: var(--warn);
+  font-weight: 500;
+}
+
+.seg {
+  display: flex;
+  gap: 6px;
+  margin: 0 0 10px;
+}
+
+.seg button {
+  flex: 1;
+  padding: 9px 6px;
+  border-radius: 10px;
+  border: 1px solid var(--line);
+  background: var(--panel);
+  color: var(--dim);
+  font-size: 12px;
+  font-family: inherit;
+}
+
+.seg button.on {
+  background: rgba(196, 149, 106, 0.16);
+  border-color: var(--accent-glow);
+  color: var(--accent-soft);
+}
+
+.row.disabled {
+  opacity: 0.42;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes pulseRing {
+  0% {
+    transform: scale(1);
+  }
+  45% {
+    transform: scale(1.055);
+  }
+  100% {
+    transform: scale(1);
+  }
+}
+
+@keyframes ripple {
+  0% {
+    opacity: 0.7;
+    transform: scale(1);
+  }
+  100% {
+    opacity: 0;
+    transform: scale(1.5);
+  }
+}
+
+@keyframes breathe {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.45;
+  }
+}
+
+@keyframes fadeUp {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}

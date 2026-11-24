@@ -1,31 +1,62 @@
-# Python
+# ── 构建产物（体积巨大，绝不进仓库）──
+dist/
+dist_old_*/
+build/
+_dist_*/
+
+# ── Python 缓存 ──
 __pycache__/
 *.pyc
 *.pyo
+*.pyd
 
-# 构建产物
-build/
-dist/
-*.spec
-_build*.log
-_smoke*.log
+# ── 备份与冗余副本 ──
+# 必须锚定根目录（前导斜杠）：不锚定时 Windows 上大小写不敏感匹配会把
+# mobile/android/.../java/cn/soulplayer/ 包目录也忽略掉——原生插件源码
+# 因此从未进过版本库，险些丢失。已实际踩坑（2026-11-10）。
+/SoulPlayer/
+/SoulPlayer_UI_Shell/
+_dev_backup_*/
+_merge_backup/
+_update_backup_*/
+_backup_*/
+NVIDIA Corporation/
+
+# ── 运行时日志与临时文件 ──
+*.log
 error.log
+*.pid
+*.tmp
 
-# 备份与临时文件
-*.bak
-_vosk_temp/
-_extract_model.py
+# ── 学习数据（运行时生成，含个人隐私）──
+learning_data/
+visual_features.json
+wave_learning.json
 
-# 用户数据（歌曲、个人预设、语音模板不随仓库上传）
-music/*
-!music/.gitkeep
-custom_presets/*
-!custom_presets/.gitkeep
-voice_templates/*
-!voice_templates/.gitkeep
-voice_templates.json
-voice_triggers.json
+# ── 大体积媒体（按需用 Release/Git LFS 分发）──
+*.mp4
 
-# 遗留依赖（当前版本无需 Vosk 语言模型）
-vosk-model/
-voice_trigger.py
+# ── IDE 本地配置 ──
+.claude/
+
+# ── 独立 git 仓库（上传包副本，避免 submodule 污染）──
+Soul player提交材料/GitHub上传包/
+
+# ── 冒烟产物 ──
+smoke_shot.png
+_smoke_last.log
+SoulPlayer.spec
+
+# ── 手机端（mobile/）──
+mobile/node_modules/
+mobile/dist/
+mobile/_shot*.png
+mobile/_dev_*/
+# APK 产物（约 5MB，按需分发，不入库；android/.gitignore 已忽略 android/ 下的构建目录）
+mobile/release/
+# 发布用的站点暂存目录（dist 副本 + APK 下载）
+mobile/site/
+
+# ── 发布应用产生的内部标记 ──
+.wbapp_*.genie
+.workbuddy/applications.yaml

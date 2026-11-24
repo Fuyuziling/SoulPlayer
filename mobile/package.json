@@ -1,0 +1,25 @@
+{
+  "name": "soulplayer-mobile",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "SoulPlayer 手机端：IMU 传感器手势驱动的音乐播放器",
+  "scripts": {
+    "dev": "vite --host 0.0.0.0",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview --host 0.0.0.0",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "devDependencies": {
+    "@capacitor/android": "^6.2.0",
+    "@capacitor/cli": "^6.2.0",
+    "puppeteer-core": "^25.16.0",
+    "typescript": "~5.6.3",
+    "vite": "^5.4.11",
+    "vitest": "^2.1.8"
+  },
+  "dependencies": {
+    "@capacitor/core": "^6.2.0"
+  }
+}
