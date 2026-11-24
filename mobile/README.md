@@ -79,6 +79,27 @@ launcher / round / adaptive-foreground 与横竖屏启动图。
 
 自适应图标的前景内容收在 52%（安全区是 66%）——放太满会在圆形遮罩下切掉两端柱子。
 
+## 预编译安装包（本分支专用）
+
+不想自己搭工具链的话，直接用仓库内这份已签名的 release 包：
+
+- 文件：[download/soulplayer-1.0.0.apk](download/soulplayer-1.0.0.apk)
+- 版本 **1.0.0**，构建于 2026-11-19，对应三个预设文件夹（舒缓 / 轻松 / 激烈）版本，
+  源码基线 `d8c32c3`
+- 大小 2.7 MB，SHA-256
+  `0ea5de10d4a769ed6e48b1258f5872f4d641821da568818657f282bacb42e5ac`
+- 应用 ID `cn.soulplayer.app`，最低 Android 5.1（minSdk 22），目标 SDK 34
+
+在 GitHub 上点开该文件并按 Download（或直接用 raw 直链下载），传到手机后点开安装，
+允许「安装未知来源应用」。Android 10+ 首次启动会申请一次「身体活动识别」权限，
+拒绝不影响使用，只是少了乘车误报抑制。
+
+> 签名密钥不在这个仓库里。自己重新打包需要本地的 `.jks` 与 `keystore.properties`；
+> 用不同签名打出的包**无法覆盖安装**这份包（系统会拒绝），只能先卸载，
+> 卸载会连带清掉应用内曲库。
+
+以后发新版时替换同名 APK，并同步更新这里的版本号与 SHA-256。
+
 ## 目录
 
 ```
@@ -90,5 +111,6 @@ mobile/
 ├── android/           Capacitor 生成的工程（含自定义传感器插件）
 ├── tests/             vitest 用例 + 合成数据 + 标定探针
 ├── tools/             build_apk.py / make_icons.py / 截图与探针脚本
-└── release/           APK 产物（不进版本库）
+├── release/           APK 产物（不进版本库）
+└── download/          预编译安装包（随本分支入库）
 ```
